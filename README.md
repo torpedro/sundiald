@@ -95,6 +95,75 @@ cargo run -- reload --config sundiald.yaml
 
 Reloads `sundiald.yaml` from disk without restarting — this picks up job/schedule/log/alert changes. The config is validated before being swapped in; an invalid file is rejected and the service keeps running on its previous config. Changing `api_bind` still requires a full restart, since it means rebinding the HTTP listener.
 
+## Install as a systemd service
+
+Build and install the release binary somewhere on the system path:
+
+```sh
+cargo build --release
+sudo install -m 0755 target/release/sundiald /usr/local/bin/sundiald
+```
+
+Create a dedicated service user and directories for config, state, and logs:
+
+```sh
+sudo useradd --system --home /var/lib/sundiald --shell /usr/sbin/nologin sundiald
+sudo install -d -o sundiald -g sundiald /etc/sundiald /var/lib/sundiald /var/log/sundiald /var/log/sundiald/jobs /var/log/sundiald/alerts
+cargo run -- sample-config | sudo tee /etc/sundiald/sundiald.yaml >/dev/null
+sudo chown root:sundiald /etc/sundiald/sundiald.yaml
+sudo chmod 0640 /etc/sundiald/sundiald.yaml
+```
+
+Edit `/etc/sundiald/sundiald.yaml` so writable paths point at the service-owned directories:
+
+```yaml
+state_dir: /var/lib/sundiald
+log_dir: /var/log/sundiald/jobs
+service_log: /var/log/sundiald/sundiald.log
+api_bind: 127.0.0.1:8787
+alert:
+  log: /var/log/sundiald/alerts.log
+  event_dir: /var/log/sundiald/alerts
+```
+
+Create `/etc/systemd/system/sundiald.service`:
+
+```ini
+[Unit]
+Description=sundiald scheduled job runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sundiald
+Group=sundiald
+ExecStart=/usr/local/bin/sundiald serve --config /etc/sundiald/sundiald.yaml
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable and start the service:
+
+```sh
+sudo systemctl daemon-reload
+sudo systemctl enable --now sundiald
+sudo systemctl status sundiald
+```
+
+Use the installed binary to inspect or control the running service:
+
+```sh
+sundiald status --config /etc/sundiald/sundiald.yaml
+sundiald reload --config /etc/sundiald/sundiald.yaml
+sundiald run heartbeat --config /etc/sundiald/sundiald.yaml
+```
+
+View service logs with `journalctl -u sundiald -f`. Per-job stdout/stderr logs are written under the configured `log_dir`, and alert events are written under `alert.event_dir`.
+
 ## Inspect
 
 ```sh

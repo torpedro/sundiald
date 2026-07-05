@@ -281,7 +281,7 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             }
             rows.push(Row::new(vec![
                 Cell::from(format!("  {}", job.name)),
-                Cell::from(compact_status(job)),
+                status_cell(job),
                 Cell::from(compact_trigger(job)),
                 Cell::from(format_last_run(job, now)),
                 Cell::from(format_next_run_plain(job, now)),
@@ -376,6 +376,20 @@ fn compact_status(job: &service::JobStatusResponse) -> String {
     }
 
     parts.join(" ")
+}
+
+fn status_cell(job: &service::JobStatusResponse) -> Cell<'static> {
+    Cell::from(compact_status(job)).style(status_style(job))
+}
+
+fn status_style(job: &service::JobStatusResponse) -> Style {
+    match job.status {
+        state::JobStatus::Succeeded => Style::default().fg(Color::Green),
+        state::JobStatus::Failed | state::JobStatus::StartFailed => Style::default().fg(Color::Red),
+        state::JobStatus::Running => Style::default().fg(Color::Yellow),
+        state::JobStatus::Interrupted => Style::default().fg(Color::Yellow),
+        state::JobStatus::Idle => Style::default(),
+    }
 }
 
 fn compact_trigger(job: &service::JobStatusResponse) -> String {
@@ -669,6 +683,17 @@ mod tests {
         job.trigger.after = Some("build".to_string());
 
         assert_eq!(compact_trigger(&job), "after build");
+    }
+
+    #[test]
+    fn status_cell_colors_success_and_failure() {
+        let mut success = job_response();
+        success.status = crate::state::JobStatus::Succeeded;
+        let mut failed = job_response();
+        failed.status = crate::state::JobStatus::Failed;
+
+        assert_eq!(status_style(&success).fg, Some(Color::Green));
+        assert_eq!(status_style(&failed).fg, Some(Color::Red));
     }
 
     #[test]

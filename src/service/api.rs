@@ -298,8 +298,9 @@ async fn api_latest_log(
         )
             .into_response();
     };
+    let config = api.config.read().await.clone();
     let runtime_base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let log_path = absolutize_path(&runtime_base, &log_path);
+    let log_path = resolve_log_path(&config.log_dir, &runtime_base, &log_path);
     match fs::read_to_string(&log_path).await {
         Ok(content) => {
             let tail = query.tail.unwrap_or(40).clamp(1, 2_000);
@@ -535,7 +536,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                 exit_code: state.and_then(|state| state.exit_code),
                 log_path: state
                     .and_then(|state| state.log_path.clone())
-                    .map(|path| absolutize_path(&runtime_base, &path)),
+                    .map(|path| resolve_log_path(&config.log_dir, &runtime_base, &path)),
                 last_error: state.and_then(|state| state.last_error.clone()),
                 terminated_by_signal: state.and_then(|state| state.terminated_by_signal.clone()),
                 next_run: next_runs.first().copied(),
@@ -567,7 +568,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
             log_path: state
                 .log_path
                 .clone()
-                .map(|path| absolutize_path(&runtime_base, &path)),
+                .map(|path| resolve_log_path(&config.log_dir, &runtime_base, &path)),
             last_error: Some(
                 "orphaned: no longer in the reloaded config, but was still running when reloaded"
                     .to_string(),
@@ -602,6 +603,16 @@ fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+fn resolve_log_path(log_dir: &Path, runtime_base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if path.components().count() == 1 {
+        return log_dir.join(path);
+    }
+    absolutize_path(runtime_base, path)
 }
 
 fn tail_lines(content: &str, max_lines: usize) -> Option<String> {
@@ -818,6 +829,26 @@ mod tests {
         let log_path = status.jobs[0].log_path.as_ref().unwrap();
         assert!(log_path.is_absolute());
         assert!(log_path.ends_with(".sundiald/logs/sleepy.log"));
+    }
+
+    #[tokio::test]
+    async fn api_status_resolves_bare_log_paths_against_configured_log_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path().to_path_buf());
+        let expected_log_dir = config.log_dir.clone();
+        let job_id = config.jobs[0].uuid.unwrap();
+        let mut snapshot = StateSnapshot::new(vec![(job_id, "sleepy".to_string())]);
+        let mut state = running_job_state(job_id, "sleepy");
+        state.log_path = Some(PathBuf::from("sleepy.log"));
+        snapshot.upsert(state);
+        let api = test_api(config, snapshot);
+
+        let status = build_status_response(&api).await;
+
+        assert_eq!(
+            status.jobs[0].log_path.as_deref(),
+            Some(expected_log_dir.join("sleepy.log").as_path())
+        );
     }
 
     #[tokio::test]

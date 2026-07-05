@@ -544,4 +544,66 @@ mod tests {
             "expected exactly one overrun alert event, got {count}"
         );
     }
+
+    #[tokio::test]
+    async fn run_job_inner_uses_shell_env_expansion_for_command_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "env".to_string(),
+            command: "SUNDIALD_TEST_VALUE=expanded; printf '%s\\n' \"$SUNDIALD_TEST_VALUE\""
+                .to_string(),
+            schedule: Schedule {
+                manual_only: true,
+                seconds: vec!["0".to_string()],
+                minutes: vec!["*".to_string()],
+                hours: vec!["*".to_string()],
+                days_of_week: vec!["*".to_string()],
+                days_of_month: vec!["*".to_string()],
+                months: vec!["*".to_string()],
+            },
+            alert_if_running_for_longer_than: None,
+            group: None,
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let log_dir = temp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+
+        run_job_inner(
+            job,
+            log_dir,
+            temp.path().join("sundiald.log"),
+            alert,
+            temp.path().to_path_buf(),
+            history,
+            Arc::clone(&state),
+            control_rx,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = state.lock().await;
+        let log_path = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.uuid == job_id)
+            .and_then(|job| job.log_path.as_ref())
+            .expect("completed job should have a log path");
+        let log = tokio::fs::read_to_string(log_path).await.unwrap();
+
+        assert!(log.contains("[stdout] expanded"));
+    }
 }

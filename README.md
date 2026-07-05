@@ -77,6 +77,8 @@ jobs:
 
 Schedule fields accept `*`, exact numbers, ranges like `1-5`, steps like `*/15`, and comma-separated values like `1,15,30`. For non-manual jobs, `seconds`, `minutes`, and `hours` are required. Seconds and minutes use `0` through `59`; hours use `0` through `23`. Weekdays accept `mon` through `sun`; months accept `jan` through `dec` or `1` through `12`. Day and month fields default to `["*"]` when omitted. Set `manual_only: true` in a schedule to disable scheduled runs while keeping manual runs available.
 
+Job `command` strings are executed through `sh -c`, so standard shell environment expansion works there, e.g. `$HOME`, `${HOME}`, and variables assigned earlier in the command string. Config path fields are resolved as paths and are not shell-expanded.
+
 If both `days_of_week` and `days_of_month` are restricted (not left as `*`), a day matches when *either* is satisfied, matching standard cron semantics — e.g. `days_of_month: ["1"]` plus `days_of_week: ["mon"]` runs on the 1st of the month *or* on Mondays, not only on a Monday that happens to be the 1st. If only one of the two is restricted, only that one applies.
 
 Failures are appended to `alert.log` and also written as JSON files under `alert.event_dir`. If `alert.command` is present, sundiald runs that configured program with configured args. If `alert.pushover` is present, sundiald sends the alert to Pushover using the configured application token and user/group key. Sundiald does not pass alert data through environment variables. A failure to deliver to `alert.command` or Pushover is logged to stderr but does not itself generate another alert.

@@ -70,7 +70,7 @@ async fn write_alert_inner(alert: &AlertConfig, job_name: &str, message: &str) -
         }
     }
     if let Some(pushover) = &alert.pushover {
-        if let Err(error) = send_pushover_alert(pushover, job_name, message, &alert_file).await {
+        if let Err(error) = send_pushover_alert(pushover, job_name, message).await {
             eprintln!("failed to send Pushover alert for job '{job_name}': {error:#}");
         }
     }
@@ -108,13 +108,12 @@ async fn send_pushover_alert(
     pushover: &PushoverConfig,
     job_name: &str,
     message: &str,
-    alert_file: &std::path::Path,
 ) -> Result<()> {
     let title = pushover
         .title
         .clone()
         .unwrap_or_else(|| format!("sundiald: {job_name} failed"));
-    let body = format!("{message}\nalert_file: {}", alert_file.display());
+    let body = pushover_message_body(job_name, message);
 
     let mut form = vec![
         ("token", pushover.token.clone()),
@@ -159,6 +158,10 @@ fn push_optional(
     }
 }
 
+fn pushover_message_body(job_name: &str, message: &str) -> String {
+    format!("{job_name}: {message}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +188,13 @@ mod tests {
         }
 
         assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn pushover_message_starts_with_job_and_omits_alert_file() {
+        let body = pushover_message_body("backup", "job exited with status 42");
+
+        assert_eq!(body, "backup: job exited with status 42");
+        assert!(!body.contains("alert_file"));
     }
 }

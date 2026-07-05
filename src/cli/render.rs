@@ -47,7 +47,7 @@ pub(crate) async fn render_status(
     if let Some(last_command) = last_command {
         output.push('\n');
         output.push_str(
-            "keys: arrows/j/k select, r run now, T SIGTERM, K SIGKILL, R reload config, q quit",
+            "keys: arrows/j/k select, Enter log, r run now, T SIGTERM, K SIGKILL, R reload config, q quit",
         );
         output.push('\n');
         output.push_str(last_command);
@@ -184,6 +184,7 @@ mod tests {
         service::JobStatusResponse {
             uuid: Uuid::new_v4(),
             name: "example".to_string(),
+            group: None,
             status,
             pid: None,
             started_at: None,

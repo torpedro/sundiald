@@ -17,7 +17,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use super::alert::write_alert;
+use super::{alert::write_alert, history::HistoryDb};
 use crate::{
     config::{AlertConfig, JobConfig},
     state::{JobState, JobStatus, StateSnapshot},
@@ -62,6 +62,7 @@ pub(crate) fn spawn_tracked_job(
     service_log: PathBuf,
     alert: AlertConfig,
     state_dir: PathBuf,
+    history: HistoryDb,
     state: Arc<Mutex<StateSnapshot>>,
     running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
     emit_stdout: bool,
@@ -83,6 +84,7 @@ pub(crate) fn spawn_tracked_job(
             service_log,
             alert,
             state_dir,
+            history,
             state,
             control_rx,
             emit_stdout,
@@ -101,6 +103,7 @@ async fn run_job(
     service_log: PathBuf,
     alert: AlertConfig,
     state_dir: PathBuf,
+    history: HistoryDb,
     state: Arc<Mutex<StateSnapshot>>,
     control_rx: mpsc::UnboundedReceiver<JobControl>,
     emit_stdout: bool,
@@ -112,6 +115,7 @@ async fn run_job(
         service_log,
         alert.clone(),
         state_dir,
+        history,
         state,
         control_rx,
         emit_stdout,
@@ -142,12 +146,32 @@ async fn persist_state(state_dir: &Path, state: &Mutex<StateSnapshot>, job_state
     }
 }
 
+async fn record_history_finished(
+    history: &HistoryDb,
+    run_id: Option<i64>,
+    job_name: &str,
+    started_at: chrono::DateTime<Local>,
+    finished_at: chrono::DateTime<Local>,
+    exit_code: Option<i32>,
+) {
+    let Some(run_id) = run_id else {
+        return;
+    };
+    if let Err(error) = history
+        .record_finished(run_id, started_at, finished_at, exit_code)
+        .await
+    {
+        eprintln!("failed to record run finish for job '{job_name}': {error:#}");
+    }
+}
+
 async fn run_job_inner(
     job: JobConfig,
     log_dir: PathBuf,
     service_log: PathBuf,
     alert: AlertConfig,
     state_dir: PathBuf,
+    history: HistoryDb,
     state: Arc<Mutex<StateSnapshot>>,
     mut control_rx: mpsc::UnboundedReceiver<JobControl>,
     emit_stdout: bool,
@@ -157,6 +181,16 @@ async fn run_job_inner(
         .uuid
         .expect("job uuid must be assigned before running (see load_and_ensure_ids)");
     let started_at = Local::now();
+    let history_run_id = match history.record_triggered(&job, started_at, manual).await {
+        Ok(run_id) => Some(run_id),
+        Err(error) => {
+            eprintln!(
+                "failed to record run trigger for job '{}': {error:#}",
+                job.name
+            );
+            None
+        }
+    };
     let log_path = log_dir.join(format!(
         "{}-{}.log",
         super::sanitize_name(&job.name),
@@ -184,6 +218,7 @@ async fn run_job_inner(
         Ok(child) => child,
         Err(error) => {
             let message = error.to_string();
+            let finished_at = Local::now();
             persist_state(
                 &state_dir,
                 &state,
@@ -193,12 +228,21 @@ async fn run_job_inner(
                     status: JobStatus::StartFailed,
                     pid: None,
                     started_at: Some(started_at),
-                    finished_at: Some(Local::now()),
+                    finished_at: Some(finished_at),
                     exit_code: None,
                     log_path: Some(log_path),
                     last_error: Some(message.clone()),
                     terminated_by_signal: None,
                 },
+            )
+            .await;
+            record_history_finished(
+                &history,
+                history_run_id,
+                &job.name,
+                started_at,
+                finished_at,
+                None,
             )
             .await;
             write_alert(&alert, &job.name, &message).await;
@@ -339,6 +383,15 @@ async fn run_job_inner(
         },
     )
     .await;
+    record_history_finished(
+        &history,
+        history_run_id,
+        &job.name,
+        started_at,
+        finished_at,
+        exit_code,
+    )
+    .await;
     super::log_service_event(
         &service_log,
         format!(
@@ -437,7 +490,10 @@ mod tests {
             // Fires the overrun check almost immediately, well before the
             // 1-second job finishes, so this test stays fast.
             alert_if_running_for_longer_than: Some("0s".to_string()),
+            group: None,
+            source_path: None,
         };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
         let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
         let (_control_tx, control_rx) = mpsc::unbounded_channel();
 
@@ -447,6 +503,7 @@ mod tests {
             temp.path().join("sundiald.log"),
             alert.clone(),
             temp.path().to_path_buf(),
+            history,
             state,
             control_rx,
             false,

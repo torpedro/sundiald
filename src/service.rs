@@ -1,6 +1,7 @@
 mod alert;
 mod api;
 mod cleanup;
+mod history;
 mod orphan;
 mod process;
 
@@ -25,6 +26,7 @@ pub use api::{JobStatusResponse, StatusResponse};
 
 use api::ApiState;
 use cleanup::cleanup_old_files;
+use history::HistoryDb;
 use orphan::alert_orphaned_process_groups;
 use process::{JobControl, RunningJob, SignalKind, spawn_tracked_job};
 
@@ -89,6 +91,7 @@ pub async fn run(config: SundialdConfig, config_path: PathBuf) -> Result<()> {
     let api_bind = config.api_bind;
     cleanup_old_files(&config.log_dir, config.log_retention_days).await;
     cleanup_old_files(&config.alert.event_dir, config.alert.retention_days).await;
+    let history = HistoryDb::open(&config.state_dir).await?;
 
     let loaded_snapshot = StateSnapshot::load(&config.state_dir).await?;
     if let Some(snapshot) = &loaded_snapshot {
@@ -132,7 +135,7 @@ pub async fn run(config: SundialdConfig, config_path: PathBuf) -> Result<()> {
             Some(job_name) = manual_rx.recv() => {
                 retain_running(&mut running);
                 let current_config = config.read().await.clone();
-                handle_manual_request(&current_config, &mut running, Arc::clone(&state), Arc::clone(&pending_manual), Arc::clone(&running_controls), job_name).await?;
+                handle_manual_request(&current_config, &mut running, history.clone(), Arc::clone(&state), Arc::clone(&pending_manual), Arc::clone(&running_controls), job_name).await?;
             }
             _ = tick.tick() => {
                 retain_running(&mut running);
@@ -158,6 +161,7 @@ pub async fn run(config: SundialdConfig, config_path: PathBuf) -> Result<()> {
                         current_config.service_log.clone(),
                         current_config.alert.clone(),
                         current_config.state_dir.clone(),
+                        history.clone(),
                         Arc::clone(&state),
                         Arc::clone(&running_controls),
                         true,
@@ -206,6 +210,7 @@ fn job_identities(config: &SundialdConfig) -> Vec<(Uuid, String)> {
 async fn handle_manual_request(
     config: &SundialdConfig,
     running: &mut HashMap<Uuid, RunningJob>,
+    history: HistoryDb,
     state: Arc<Mutex<StateSnapshot>>,
     pending_manual: Arc<Mutex<HashSet<String>>>,
     running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
@@ -262,6 +267,7 @@ async fn handle_manual_request(
         config.service_log.clone(),
         config.alert.clone(),
         config.state_dir.clone(),
+        history,
         state,
         running_controls,
         true,

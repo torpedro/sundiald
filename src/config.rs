@@ -6,7 +6,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use anyhow::{Context, Result, bail};
@@ -30,7 +30,15 @@ pub struct SundialdConfig {
     #[serde(default)]
     pub alert: AlertConfig,
     #[serde(default)]
+    pub job_files: Vec<JobFileConfig>,
+    #[serde(default)]
     pub jobs: Vec<JobConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct JobFileConfig {
+    pub name: String,
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -90,6 +98,13 @@ pub struct JobConfig {
     /// compound value like `"1h30m"`.
     #[serde(default)]
     pub alert_if_running_for_longer_than: Option<String>,
+    /// Display grouping for jobs loaded from a named external job file.
+    #[serde(skip)]
+    pub group: Option<String>,
+    /// YAML file this job came from, used to persist generated UUIDs back to
+    /// the right source file without re-serializing unrelated config.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
 }
 
 impl JobConfig {
@@ -109,10 +124,32 @@ impl SundialdConfig {
     pub fn load(path: &PathBuf) -> Result<Self> {
         let raw = fs::read_to_string(path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        let config: Self = serde_yaml::from_str(&raw)
+        let mut config: Self = serde_yaml::from_str(&raw)
             .with_context(|| format!("failed to parse YAML config {}", path.display()))?;
+        config.load_job_files(path)?;
         config.validate()?;
         Ok(config)
+    }
+
+    fn load_job_files(&mut self, config_path: &Path) -> Result<()> {
+        for job in &mut self.jobs {
+            job.source_path = Some(config_path.to_path_buf());
+        }
+
+        let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
+        for job_file in &self.job_files {
+            let path = resolve_path(config_dir, &job_file.path);
+            let raw = fs::read_to_string(&path)
+                .with_context(|| format!("failed to read job file {}", path.display()))?;
+            let mut jobs: Vec<JobConfig> = serde_yaml::from_str(&raw)
+                .with_context(|| format!("failed to parse job file {}", path.display()))?;
+            for job in &mut jobs {
+                job.group = Some(job_file.name.clone());
+                job.source_path = Some(path.clone());
+            }
+            self.jobs.extend(jobs);
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -132,6 +169,19 @@ impl SundialdConfig {
                 if !(-2..=2).contains(&priority) {
                     bail!("alert.pushover.priority must be between -2 and 2");
                 }
+            }
+        }
+
+        let mut job_file_names = HashSet::new();
+        for job_file in &self.job_files {
+            if job_file.name.trim().is_empty() {
+                bail!("job_files.name cannot be empty");
+            }
+            if !job_file_names.insert(job_file.name.clone()) {
+                bail!("duplicate job_files name '{}'", job_file.name);
+            }
+            if job_file.path.as_os_str().is_empty() {
+                bail!("job_files '{}' path cannot be empty", job_file.name);
             }
         }
 
@@ -168,37 +218,55 @@ impl SundialdConfig {
     }
 
     /// Like `load`, but also assigns a fresh UUID to any job missing one and
-    /// persists it back to `path` before returning — a minimal, targeted
-    /// text patch that inserts `uuid: <uuid>` lines rather than
+    /// persists it back to the YAML file that defined that job before
+    /// returning — a minimal, targeted text patch that inserts `uuid: <uuid>` lines rather than
     /// re-serializing the whole file, so hand-written comments and
     /// formatting elsewhere in the config survive untouched.
     pub fn load_and_ensure_ids(path: &PathBuf) -> Result<Self> {
         let mut config = Self::load(path)?;
 
-        let missing: Vec<(String, Uuid)> = config
+        let missing: Vec<(PathBuf, String, Uuid)> = config
             .jobs
             .iter()
             .filter(|job| job.uuid.is_none())
-            .map(|job| (job.name.clone(), Uuid::new_v4()))
+            .map(|job| {
+                (
+                    job.source_path.clone().unwrap_or_else(|| path.clone()),
+                    job.name.clone(),
+                    Uuid::new_v4(),
+                )
+            })
             .collect();
         if missing.is_empty() {
             return Ok(config);
         }
 
-        let raw = fs::read_to_string(path)
-            .with_context(|| format!("failed to read config {}", path.display()))?;
-        let patched = uuid_patch::insert_missing_job_uuids(&raw, &missing).with_context(|| {
-            format!(
-                "failed to persist generated job uuids into {}",
-                path.display()
-            )
-        })?;
-        fs::write(path, &patched)
-            .with_context(|| format!("failed to persist job uuids to {}", path.display()))?;
+        let mut missing_by_path: HashMap<PathBuf, Vec<(String, Uuid)>> = HashMap::new();
+        for (source_path, name, uuid) in &missing {
+            missing_by_path
+                .entry(source_path.clone())
+                .or_default()
+                .push((name.clone(), *uuid));
+        }
+
+        for (source_path, missing_jobs) in missing_by_path {
+            let raw = fs::read_to_string(&source_path)
+                .with_context(|| format!("failed to read config {}", source_path.display()))?;
+            let patched =
+                uuid_patch::insert_missing_job_uuids(&raw, &missing_jobs).with_context(|| {
+                    format!(
+                        "failed to persist generated job uuids into {}",
+                        source_path.display()
+                    )
+                })?;
+            fs::write(&source_path, &patched).with_context(|| {
+                format!("failed to persist job uuids to {}", source_path.display())
+            })?;
+        }
 
         let assigned: HashMap<&str, Uuid> = missing
             .iter()
-            .map(|(name, uuid)| (name.as_str(), *uuid))
+            .map(|(_, name, uuid)| (name.as_str(), *uuid))
             .collect();
         for job in &mut config.jobs {
             if job.uuid.is_none() {
@@ -207,6 +275,14 @@ impl SundialdConfig {
         }
 
         Ok(config)
+    }
+}
+
+fn resolve_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
     }
 }
 
@@ -279,6 +355,11 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
+# Optional named files containing additional job definitions.
+# Each file is a YAML list of jobs, using the same shape as entries under `jobs`.
+# job_files:
+#   - name: maintenance
+#     path: jobs/maintenance.yaml
 jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541
@@ -392,6 +473,79 @@ jobs:
             config.jobs[0].alert_threshold(),
             Some(std::time::Duration::from_secs(600))
         );
+    }
+
+    #[test]
+    fn config_loads_named_external_job_files_relative_to_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let jobs_dir = temp.path().join("jobs");
+        std::fs::create_dir(&jobs_dir).unwrap();
+        std::fs::write(
+            jobs_dir.join("maintenance.yaml"),
+            r#"
+- name: cleanup
+  command: "true"
+  schedule:
+    minutes: ["0"]
+"#,
+        )
+        .unwrap();
+        let config_path = temp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+job_files:
+  - name: maintenance
+    path: jobs/maintenance.yaml
+"#,
+        )
+        .unwrap();
+
+        let config = SundialdConfig::load(&config_path).unwrap();
+
+        assert_eq!(config.jobs.len(), 1);
+        assert_eq!(config.jobs[0].name, "cleanup");
+        assert_eq!(config.jobs[0].group.as_deref(), Some("maintenance"));
+        assert_eq!(
+            config.jobs[0].source_path.as_deref(),
+            Some(jobs_dir.join("maintenance.yaml").as_path())
+        );
+    }
+
+    #[test]
+    fn load_and_ensure_ids_patches_the_external_job_file_that_defined_the_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let external_path = temp.path().join("ops.yaml");
+        std::fs::write(
+            &external_path,
+            r#"
+- name: rotate-logs
+  # keep this comment next to the job definition
+  command: "true"
+  schedule:
+    minutes: ["0"]
+"#,
+        )
+        .unwrap();
+        let config_path = temp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+job_files:
+  - name: ops
+    path: ops.yaml
+"#,
+        )
+        .unwrap();
+
+        let config = SundialdConfig::load_and_ensure_ids(&config_path).unwrap();
+        let patched_external = std::fs::read_to_string(&external_path).unwrap();
+        let root_config = std::fs::read_to_string(&config_path).unwrap();
+
+        assert!(config.jobs[0].uuid.is_some());
+        assert!(patched_external.contains("  uuid: "));
+        assert!(patched_external.contains("  # keep this comment"));
+        assert!(!root_config.contains("uuid:"));
     }
 
     #[test]

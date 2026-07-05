@@ -6,6 +6,7 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio::{
+    fs,
     sync::mpsc,
     time::{self, Duration},
 };
@@ -97,6 +98,11 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                         last_command =
                             post_watch_action(&config, "/reload", "config reloaded").await;
                     }
+                    KeyCode::Enter => {
+                        if let Some(job) = jobs.get(selected) {
+                            last_command = read_recent_log(job).await;
+                        }
+                    }
                     _ => {}
                 }
                 jobs = redraw_status(&config, Some(selected), Some(&last_command)).await?;
@@ -106,6 +112,36 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn read_recent_log(job: &service::JobStatusResponse) -> String {
+    let Some(log_path) = &job.log_path else {
+        return format!("log: no log file for {}", job.name);
+    };
+
+    match fs::read_to_string(log_path).await {
+        Ok(content) => format!(
+            "log: {}\n---- stdout/stderr ----\n{}",
+            log_path.display(),
+            tail_lines(&content, 40).unwrap_or_else(|| "(empty log)".to_string())
+        ),
+        Err(error) => format!("log: failed to read {}: {error}", log_path.display()),
+    }
+}
+
+fn tail_lines(content: &str, max_lines: usize) -> Option<String> {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = lines.len().saturating_sub(max_lines);
+    let mut output = String::new();
+    if start > 0 {
+        output.push_str(&format!("... {} earlier line(s) omitted\n", start));
+    }
+    output.push_str(&lines[start..].join("\n"));
+    Some(output)
 }
 
 /// Fire-and-report POST used by watch mode's key handlers: unlike the
@@ -194,5 +230,24 @@ impl Drop for WatchTerminal {
         let _ = write!(stdout, "\x1B[?25h\x1B[?1049l");
         let _ = stdout.flush();
         let _ = crossterm::terminal::disable_raw_mode();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_lines_limits_output_and_reports_omitted_lines() {
+        let content = "one\ntwo\nthree\nfour";
+
+        let tail = tail_lines(content, 2).unwrap();
+
+        assert_eq!(tail, "... 2 earlier line(s) omitted\nthree\nfour");
+    }
+
+    #[test]
+    fn tail_lines_reports_empty_logs() {
+        assert!(tail_lines("", 40).is_none());
     }
 }

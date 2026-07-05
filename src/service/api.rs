@@ -50,6 +50,7 @@ pub struct StatusResponse {
 pub struct JobStatusResponse {
     pub uuid: Uuid,
     pub name: String,
+    pub group: Option<String>,
     pub status: JobStatus,
     pub pid: Option<u32>,
     pub started_at: Option<DateTime<Local>>,
@@ -120,7 +121,10 @@ async fn api_reload(State(api): State<ApiState>) -> Response {
             let _ = fs::create_dir_all(&new_config.log_dir).await;
             let _ = fs::create_dir_all(&new_config.alert.event_dir).await;
             *api.config.write().await = new_config;
-            eprintln!("sundiald config reloaded from {}", api.config_path.display());
+            eprintln!(
+                "sundiald config reloaded from {}",
+                api.config_path.display()
+            );
             (
                 StatusCode::OK,
                 Json(ReloadResponse {
@@ -323,6 +327,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
             JobStatusResponse {
                 uuid,
                 name: job.name.clone(),
+                group: job.group.clone(),
                 status: state
                     .map(|state| state.status.clone())
                     .unwrap_or(JobStatus::Idle),
@@ -352,6 +357,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
         jobs.push(JobStatusResponse {
             uuid: *uuid,
             name: state.name.clone(),
+            group: None,
             status: state.status.clone(),
             pid: state.pid,
             started_at: state.started_at,
@@ -391,6 +397,7 @@ mod tests {
             api_bind: "127.0.0.1:0".parse().unwrap(),
             log_retention_days: 14,
             alert: AlertConfig::default(),
+            job_files: Vec::new(),
             jobs: vec![JobConfig {
                 uuid: Some(Uuid::new_v4()),
                 name: "sleepy".to_string(),
@@ -405,6 +412,8 @@ mod tests {
                     months: vec!["*".to_string()],
                 },
                 alert_if_running_for_longer_than: None,
+                group: None,
+                source_path: None,
             }],
         }
     }

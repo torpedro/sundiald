@@ -3,7 +3,7 @@ mod config;
 mod service;
 mod state;
 
-use std::path::PathBuf;
+use std::{env, path::PathBuf};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -22,56 +22,67 @@ enum Command {
     /// Run the long-lived job runner service.
     Serve {
         /// YAML config file to load.
-        #[arg(short, long, default_value = "sundiald.yaml")]
-        config: PathBuf,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// Validate and summarize the YAML config.
     Config {
         /// YAML config file to inspect.
-        #[arg(short, long, default_value = "sundiald.yaml")]
-        config: PathBuf,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// Run a configured job immediately.
     Run {
         /// Job name to run.
         job: String,
         /// YAML config file to load.
-        #[arg(short, long, default_value = "sundiald.yaml")]
-        config: PathBuf,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// Send SIGTERM to a running job.
     Terminate {
         /// Job name to terminate.
         job: String,
         /// YAML config file to load.
-        #[arg(short, long, default_value = "sundiald.yaml")]
-        config: PathBuf,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// Send SIGKILL to a running job.
     Kill {
         /// Job name to kill.
         job: String,
         /// YAML config file to load.
-        #[arg(short, long, default_value = "sundiald.yaml")]
-        config: PathBuf,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// Tell the running service to reload its config from disk.
     Reload {
         /// YAML config file to load (used to locate the running service's API).
-        #[arg(short, long, default_value = "sundiald.yaml")]
-        config: PathBuf,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
     },
     /// Show configured jobs, high-level run status, last run, and next run.
     Status {
         /// YAML config file to inspect.
-        #[arg(short, long, default_value = "sundiald.yaml")]
-        config: PathBuf,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
         /// Keep status live and refresh every second.
         #[arg(short, long)]
         watch: bool,
     },
     /// Print a starter YAML config.
     SampleConfig,
+}
+
+fn default_config_path() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".config/sundiald/config.yaml")
+}
+
+fn resolve_config_path(config: Option<PathBuf>) -> PathBuf {
+    config.unwrap_or_else(default_config_path)
 }
 
 #[tokio::main]
@@ -82,10 +93,12 @@ async fn main() -> Result<()> {
         Command::Serve {
             config: config_path,
         } => {
+            let config_path = resolve_config_path(config_path);
             let config = SundialdConfig::load_and_ensure_ids(&config_path)?;
             service::run(config, config_path).await
         }
         Command::Config { config } => {
+            let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             println!("config: ok");
             println!("state_dir: {}", config.state_dir.display());
@@ -106,16 +119,26 @@ async fn main() -> Result<()> {
             if config.alert.pushover.is_some() {
                 println!("alert.pushover: configured");
             }
+            println!("job_files: {}", config.job_files.len());
+            for job_file in &config.job_files {
+                println!("- {}: {}", job_file.name, job_file.path.display());
+            }
             println!("jobs: {}", config.jobs.len());
             for job in &config.jobs {
+                let group = job
+                    .group
+                    .as_deref()
+                    .map(|group| format!(" group={group}"))
+                    .unwrap_or_default();
                 match job.uuid {
-                    Some(uuid) => println!("- {} [{uuid}]: {}", job.name, job.command),
-                    None => println!("- {} [no uuid yet]: {}", job.name, job.command),
+                    Some(uuid) => println!("- {} [{uuid}{group}]: {}", job.name, job.command),
+                    None => println!("- {} [no uuid yet{group}]: {}", job.name, job.command),
                 }
             }
             Ok(())
         }
         Command::Run { job, config } => {
+            let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             cli::post_job_action(
                 &config,
@@ -126,6 +149,7 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Terminate { job, config } => {
+            let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             cli::post_job_action(
                 &config,
@@ -136,14 +160,17 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Kill { job, config } => {
+            let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             cli::post_job_action(&config, &job, "kill", &format!("sent SIGKILL to {job}")).await
         }
         Command::Reload { config } => {
+            let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             cli::reload_config(&config).await
         }
         Command::Status { config, watch } => {
+            let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             if watch {
                 cli::watch_status(config).await?;

@@ -13,7 +13,8 @@ cargo build
 Generate a starter config:
 
 ```sh
-cargo run -- sample-config > sundiald.yaml
+mkdir -p ~/.config/sundiald
+cargo run -- sample-config > ~/.config/sundiald/config.yaml
 ```
 
 ```yaml
@@ -39,6 +40,11 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
+# Optional named files containing additional job definitions.
+# Each file is a YAML list of jobs, using the same shape as entries under `jobs`.
+# job_files:
+#   - name: maintenance
+#     path: jobs/maintenance.yaml
 jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541
@@ -81,19 +87,49 @@ Job log files under `log_dir` and alert event JSON files under `alert.event_dir`
 
 Each job has a stable `uuid` used internally to track it across renames — `name` is just a label. You don't need to set `uuid` by hand: `serve` (and `reload`) generate one for any job missing it and write it back into the YAML file in place, next to that job's `name`, without disturbing comments or formatting elsewhere in the file. As long as you keep the `uuid` line when you rename a job, the service recognizes it as the same job across the rename — its live/last run status carries over under the new name instead of resetting. Removing a job from the config entirely (not renaming it) while it's still running leaves it visible in `status` and controllable by its last-known name until it finishes, since there's no new name to carry it forward to.
 
+Use `job_files` to split job definitions into named external files:
+
+```yaml
+job_files:
+  - name: maintenance
+    path: jobs/maintenance.yaml
+  - name: reports
+    path: /etc/sundiald/reports.yaml
+```
+
+Each referenced file is a YAML list of job definitions:
+
+```yaml
+- name: rotate-logs
+  command: "/usr/local/bin/rotate-app-logs"
+  schedule:
+    minutes: ["0"]
+    hours: ["3"]
+- name: rebuild-report
+  command: "/usr/local/bin/rebuild-report"
+  schedule:
+    manual_only: true
+```
+
+Relative `job_files.path` values are resolved relative to the main config file. Jobs loaded from a job file keep the file's `name` as their `group` in the HTTP status response, so callers can present them grouped by source later. Missing job UUIDs are written back to the file that defined the job, not necessarily the main config.
+
 ## Run the service
 
 ```sh
-cargo run -- serve --config sundiald.yaml
+cargo run -- serve
 ```
+
+When `--config` is not supplied, sundiald reads `~/.config/sundiald/config.yaml`. Pass `--config <path>` to use a different config file.
 
 Job state (status, last run, exit code) persists in `state_dir/state.json` and is reloaded on startup, so `status` reflects history across restarts. A job that was `running` when the service last stopped is marked `interrupted`, since its process died with the previous instance and its actual outcome is unknown. On Unix, if sundiald sees that the previous run's process group is still present during startup, it writes an alert for the orphaned process group but does not kill it automatically.
 
+Run history is recorded in a SQLite database at `state_dir/history.sqlite3`. Each run inserts a row when the job is triggered, including the trigger time and whether it was `automatic` or `manual`; when the run finishes, that row is updated with finish time, duration in milliseconds, and exit code. A job that fails to start still gets a history row with a finish time and duration, but no exit code.
+
 ```sh
-cargo run -- reload --config sundiald.yaml
+cargo run -- reload
 ```
 
-Reloads `sundiald.yaml` from disk without restarting — this picks up job/schedule/log/alert changes. The config is validated before being swapped in; an invalid file is rejected and the service keeps running on its previous config. Changing `api_bind` still requires a full restart, since it means rebinding the HTTP listener.
+Reloads the config from disk without restarting — this picks up job/schedule/log/alert changes. The config is validated before being swapped in; an invalid file is rejected and the service keeps running on its previous config. Changing `api_bind` still requires a full restart, since it means rebinding the HTTP listener.
 
 ## Install as a systemd service
 
@@ -167,15 +203,15 @@ View service logs with `journalctl -u sundiald -f`. Per-job stdout/stderr logs a
 ## Inspect
 
 ```sh
-cargo run -- config --config sundiald.yaml
-cargo run -- run heartbeat --config sundiald.yaml
-cargo run -- terminate sleepy --config sundiald.yaml
-cargo run -- kill sleepy --config sundiald.yaml
-cargo run -- status --config sundiald.yaml
-cargo run -- status --config sundiald.yaml --watch
+cargo run -- config
+cargo run -- run heartbeat
+cargo run -- terminate sleepy
+cargo run -- kill sleepy
+cargo run -- status
+cargo run -- status --watch
 ```
 
-In watch mode, use arrow keys or `j`/`k` to select a job, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
+In watch mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
 
 Manual runs are requested through the HTTP API and executed by the long-running `serve` process, so ad-hoc jobs are still child processes of the main sundiald service.
 
@@ -193,4 +229,4 @@ curl -X POST http://127.0.0.1:8787/reload
 
 The CLI uses this API for `status`, `status --watch`, `run`/`terminate`/`kill`, and `reload`, so the same surface can back a web UI later.
 
-`/status` reports a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted` (was `running` when the service last restarted) per job, plus a `terminated_by_signal` field (`"SIGTERM"`/`"SIGKILL"`/`null`) when a run ended because it was signaled via `terminate`/`kill` rather than exiting on its own, and a `uuid` field with the job's stable identity.
+`/status` reports a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted` (was `running` when the service last restarted) per job, plus a `terminated_by_signal` field (`"SIGTERM"`/`"SIGKILL"`/`null`) when a run ended because it was signaled via `terminate`/`kill` rather than exiting on its own, a `uuid` field with the job's stable identity, and a `group` field for jobs loaded from a named job file.

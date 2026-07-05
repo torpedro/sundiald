@@ -60,6 +60,7 @@ pub struct JobStatusResponse {
     pub last_error: Option<String>,
     pub terminated_by_signal: Option<String>,
     pub next_run: Option<DateTime<Local>>,
+    pub next_runs: Vec<DateTime<Local>>,
     pub manual_only: bool,
     pub manual_pending: bool,
 }
@@ -338,6 +339,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                 .uuid
                 .expect("job uuid must be assigned before serving status");
             let state = by_id.get(&uuid);
+            let next_runs = job.schedule.next_runs(now, 10);
             JobStatusResponse {
                 uuid,
                 name: job.name.clone(),
@@ -354,7 +356,8 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                     .map(|path| absolutize_path(&runtime_base, &path)),
                 last_error: state.and_then(|state| state.last_error.clone()),
                 terminated_by_signal: state.and_then(|state| state.terminated_by_signal.clone()),
-                next_run: job.schedule.next_runs(now, 1).into_iter().next(),
+                next_run: next_runs.first().copied(),
+                next_runs,
                 manual_only: job.schedule.manual_only,
                 manual_pending: pending.contains(&job.name),
             }
@@ -389,6 +392,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
             ),
             terminated_by_signal: state.terminated_by_signal.clone(),
             next_run: None,
+            next_runs: Vec::new(),
             manual_only: true,
             manual_pending: false,
         });
@@ -545,6 +549,11 @@ mod tests {
 
         assert_eq!(status.jobs[0].name, "sleepy");
         assert_eq!(status.jobs[0].uuid, job_id);
+        assert_eq!(status.jobs[0].next_runs.len(), 10);
+        assert_eq!(
+            status.jobs[0].next_run,
+            status.jobs[0].next_runs.first().copied()
+        );
 
         let response = client
             .post(format!("http://{addr}/jobs/sleepy/run"))

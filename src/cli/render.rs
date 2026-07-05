@@ -47,7 +47,7 @@ pub(crate) async fn render_status(
     if let Some(last_command) = last_command {
         output.push('\n');
         output.push_str(
-            "keys: arrows/j/k select, Enter log, r run now, T SIGTERM, K SIGKILL, R reload config, q quit",
+            "keys: arrows/j/k select, Enter log, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, q quit",
         );
         output.push('\n');
         output.push_str(last_command);
@@ -223,6 +223,7 @@ mod tests {
             last_error: None,
             terminated_by_signal: None,
             next_run: None,
+            next_runs: Vec::new(),
             manual_only: false,
             manual_pending: false,
         }

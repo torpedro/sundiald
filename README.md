@@ -212,7 +212,7 @@ cargo run -- ui
 cargo run -- ui --once
 ```
 
-The `ui` command opens the interactive view by default. Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
+The `ui` command opens the interactive view by default. Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `s` to show the next 10 scheduled runs, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
 
 Manual runs are requested through the HTTP API and executed by the long-running `daemon` process, so ad-hoc jobs are still child processes of the main sundiald service.
 

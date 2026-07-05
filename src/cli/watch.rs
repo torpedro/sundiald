@@ -98,6 +98,11 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                         last_command =
                             post_watch_action(&config, "/reload", "config reloaded").await;
                     }
+                    KeyCode::Char('s') => {
+                        if let Some(job) = jobs.get(selected) {
+                            last_command = render_schedule(job);
+                        }
+                    }
                     KeyCode::Enter => {
                         if let Some(job) = jobs.get(selected) {
                             last_command = read_recent_log(job).await;
@@ -112,6 +117,29 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn render_schedule(job: &service::JobStatusResponse) -> String {
+    if job.manual_only {
+        return format!("schedule: {} is manual only", job.name);
+    }
+    if job.next_runs.is_empty() {
+        return format!("schedule: no upcoming runs found for {}", job.name);
+    }
+
+    let mut output = format!(
+        "schedule: next {} run(s) for {}",
+        job.next_runs.len(),
+        job.name
+    );
+    for (index, run) in job.next_runs.iter().enumerate() {
+        output.push_str(&format!(
+            "\n{:>2}. {}",
+            index + 1,
+            run.format("%Y-%m-%d %H:%M:%S %:z")
+        ));
+    }
+    output
 }
 
 async fn read_recent_log(job: &service::JobStatusResponse) -> String {
@@ -236,6 +264,28 @@ impl Drop for WatchTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use uuid::Uuid;
+
+    fn job_response() -> service::JobStatusResponse {
+        service::JobStatusResponse {
+            uuid: Uuid::new_v4(),
+            name: "example".to_string(),
+            group: None,
+            status: crate::state::JobStatus::Idle,
+            pid: None,
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            log_path: None,
+            last_error: None,
+            terminated_by_signal: None,
+            next_run: None,
+            next_runs: Vec::new(),
+            manual_only: false,
+            manual_pending: false,
+        }
+    }
 
     #[test]
     fn tail_lines_limits_output_and_reports_omitted_lines() {
@@ -249,5 +299,28 @@ mod tests {
     #[test]
     fn tail_lines_reports_empty_logs() {
         assert!(tail_lines("", 40).is_none());
+    }
+
+    #[test]
+    fn render_schedule_lists_next_runs_for_selected_job() {
+        let mut job = job_response();
+        job.next_runs = vec![
+            chrono::Local.with_ymd_and_hms(2026, 1, 1, 3, 0, 0).unwrap(),
+            chrono::Local.with_ymd_and_hms(2026, 1, 2, 3, 0, 0).unwrap(),
+        ];
+
+        let output = render_schedule(&job);
+
+        assert!(output.contains("schedule: next 2 run(s) for example"));
+        assert!(output.contains(" 1. 2026-01-01 03:00:00"));
+        assert!(output.contains(" 2. 2026-01-02 03:00:00"));
+    }
+
+    #[test]
+    fn render_schedule_reports_manual_only_jobs() {
+        let mut job = job_response();
+        job.manual_only = true;
+
+        assert_eq!(render_schedule(&job), "schedule: example is manual only");
     }
 }

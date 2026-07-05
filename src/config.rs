@@ -4,7 +4,7 @@ mod uuid_patch;
 
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    env, fs,
     net::SocketAddr,
     path::{Path, PathBuf},
 };
@@ -449,15 +449,15 @@ fn job_context(job: &JobConfig) -> String {
 }
 
 fn default_state_dir() -> PathBuf {
-    PathBuf::from(".sundiald")
+    default_user_state_dir()
 }
 
 fn default_log_dir() -> PathBuf {
-    PathBuf::from(".sundiald/logs")
+    default_user_state_dir().join("logs")
 }
 
 fn default_service_log() -> PathBuf {
-    PathBuf::from(".sundiald/sundiald.log")
+    default_user_state_dir().join("sundiald.log")
 }
 
 fn default_api_bind() -> SocketAddr {
@@ -467,11 +467,11 @@ fn default_api_bind() -> SocketAddr {
 }
 
 fn default_alert_log() -> PathBuf {
-    PathBuf::from(".sundiald/alerts.log")
+    default_user_state_dir().join("alerts.log")
 }
 
 fn default_alert_event_dir() -> PathBuf {
-    PathBuf::from(".sundiald/alerts")
+    default_user_state_dir().join("alerts")
 }
 
 fn default_log_retention_days() -> u32 {
@@ -494,23 +494,31 @@ impl Default for AlertConfig {
     }
 }
 
-pub fn sample_config() -> &'static str {
-    r#"state_dir: .sundiald
-log_dir: .sundiald/logs
-service_log: .sundiald/sundiald.log
+fn default_user_state_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("~"))
+        .join(".local/state/sundiald")
+}
+
+pub fn sample_config() -> String {
+    format!(
+        r#"state_dir: {state_dir}
+log_dir: {log_dir}
+service_log: {service_log}
 api_bind: 127.0.0.1:8787
 # Delete job log files older than this many days. Set to 0 to keep logs forever.
 log_retention_days: 14
 alert:
-  log: .sundiald/alerts.log
-  event_dir: .sundiald/alerts
+  log: {alert_log}
+  event_dir: {alert_event_dir}
   # Delete alert event JSON files older than this many days. Set to 0 to keep forever.
   retention_days: 90
   # Optional command run when a job fails. No environment variables are used.
-  # Placeholders available in args: {job}, {message}, {alert_file}
+  # Placeholders available in args: {{job}}, {{message}}, {{alert_file}}
   # command:
   #   program: /usr/local/bin/sundiald-alert
-  #   args: ["--event", "{alert_file}"]
+  #   args: ["--event", "{{alert_file}}"]
   # Optional Pushover output. Credentials are read from this config file.
   # pushover:
   #   token: "your-pushover-application-token"
@@ -542,7 +550,13 @@ jobs:
     uuid: 14036dee-250c-4625-a3d6-21a068f82a4a
     command: "echo this job fails; exit 42"
     trigger: manual
-"#
+"#,
+        state_dir = default_state_dir().display(),
+        log_dir = default_log_dir().display(),
+        service_log = default_service_log().display(),
+        alert_log = default_alert_log().display(),
+        alert_event_dir = default_alert_event_dir().display(),
+    )
 }
 
 #[cfg(test)]
@@ -910,11 +924,29 @@ alert:
     #[test]
     fn sample_config_matches_example_file() {
         // Keeps sample_config(), the README snippet, and examples/sundiald.yaml
-        // from silently drifting apart; update all three together.
+        // from silently drifting apart; update all three together. The
+        // generated sample uses the current user's HOME, while the checked-in
+        // example uses a portable placeholder.
         let example_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/sundiald.yaml");
         let example = std::fs::read_to_string(example_path).unwrap();
-        assert_eq!(sample_config(), example);
+        let generated = sample_config();
+        let generated = env::var_os("HOME")
+            .map(|home| generated.replace(&home.to_string_lossy().to_string(), "/home/you"))
+            .unwrap_or(generated);
+
+        assert_eq!(generated, example);
+    }
+
+    #[test]
+    fn default_runtime_paths_use_home_local_state() {
+        let state_dir = default_state_dir();
+
+        assert!(state_dir.ends_with(".local/state/sundiald"));
+        assert_eq!(default_log_dir(), state_dir.join("logs"));
+        assert_eq!(default_service_log(), state_dir.join("sundiald.log"));
+        assert_eq!(default_alert_log(), state_dir.join("alerts.log"));
+        assert_eq!(default_alert_event_dir(), state_dir.join("alerts"));
     }
 
     #[test]

@@ -375,6 +375,7 @@ mod tests {
             trigger: JobTrigger::Manual,
             alert_if_running_for_longer_than: None,
             group: None,
+            env: HashMap::new(),
             source_path: None,
         }
     }
@@ -394,6 +395,7 @@ mod tests {
             api_bind: "127.0.0.1:0".parse().unwrap(),
             log_retention_days: 14,
             alert: AlertConfig::default(),
+            env: HashMap::new(),
             job_files: Vec::new(),
             jobs: vec![upstream.clone(), downstream.clone()],
         };

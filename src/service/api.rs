@@ -636,6 +636,7 @@ mod tests {
             api_bind: "127.0.0.1:0".parse().unwrap(),
             log_retention_days: 14,
             alert: AlertConfig::default(),
+            env: HashMap::new(),
             job_files: Vec::new(),
             jobs: vec![JobConfig {
                 uuid: Some(Uuid::new_v4()),
@@ -651,6 +652,7 @@ mod tests {
                 }),
                 alert_if_running_for_longer_than: None,
                 group: None,
+                env: HashMap::new(),
                 source_path: None,
             }],
         }

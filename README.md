@@ -40,11 +40,14 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
+# Environment variables inherited by inline jobs in this file.
+env:
+  APP_ENV: production
 # Optional named files containing additional job definitions.
-# Each file is a YAML list of jobs, using the same shape as entries under `jobs`.
+# Each file is a YAML map with optional `env` and a required `jobs` list.
 # job_files:
 #   - name: maintenance
-#     path: jobs/maintenance.yaml
+#     path: maintenance.yaml
 jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541
@@ -68,7 +71,7 @@ Each job has one `trigger`: `schedule`, `after`, or `manual`. Scheduled jobs run
 
 Schedules use a six-field cron expression under `trigger.schedule`: `second minute hour day-of-month month day-of-week`. Fields accept `*`, exact numbers, ranges like `1-5`, steps like `*/15`, and comma-separated values like `1,15,30`. Seconds and minutes use `0` through `59`; hours use `0` through `23`. Weekdays accept `mon` through `sun`; months accept `jan` through `dec` or `1` through `12`.
 
-Job `command` strings are executed through `sh -c`, so standard shell environment expansion works there, e.g. `$HOME`, `${HOME}`, and variables assigned earlier in the command string. Config path fields are resolved as paths and are not shell-expanded.
+Job `command` strings are executed through `sh -c`, so standard shell environment expansion works there, e.g. `$HOME`, `${HOME}`, and variables assigned earlier in the command string. Environment variables under the root `env` map are inherited by inline jobs in `sundiald.yaml`; external job files can define their own top-level `env` map for jobs in that file. Config path fields are resolved as paths and are not shell-expanded.
 
 If both day-of-week and day-of-month are restricted (not left as `*`), a day matches when *either* is satisfied, matching standard cron semantics — e.g. `0 0 9 1 * mon` runs at 09:00:00 on the 1st of the month *or* on Mondays, not only on a Monday that happens to be the 1st. If only one of the two is restricted, only that one applies.
 
@@ -85,28 +88,30 @@ Use `job_files` to split job definitions into named external files:
 ```yaml
 job_files:
   - name: maintenance
-    path: jobs/maintenance.yaml
+    path: maintenance.yaml
   - name: reports
     path: /etc/sundiald/reports.yaml
 ```
 
-Each referenced file is a YAML list of job definitions:
+Each referenced file must be a YAML map with an optional `env` map and a required `jobs` list:
 
 ```yaml
-- name: rotate-logs
-  command: "/usr/local/bin/rotate-app-logs"
-  trigger:
-    schedule: "0 0 3 * * *"
-- name: rebuild-report
-  command: "/usr/local/bin/rebuild-report"
-  trigger: manual
-- name: publish-report
-  command: "/usr/local/bin/publish-report"
-  trigger:
-    after: rebuild-report
+env:
+  APP_ENV: production
+  REPORT_ROOT: /srv/reports
+jobs:
+  - name: rotate-logs
+    command: "/usr/local/bin/rotate-app-logs"
+    trigger:
+      schedule: "0 0 3 * * *"
+  - name: rebuild-report
+    command: "/usr/local/bin/rebuild-report"
+    trigger: manual
 ```
 
-Relative `job_files.path` values are resolved relative to the main config file. Jobs loaded from a job file keep the file's `name` as their `group` in the HTTP status response, so callers can present them grouped by source later. Missing job UUIDs are written back to the file that defined the job, not necessarily the main config.
+See [examples/maintenance.yaml](/home/pedro/sundiald.git/examples/maintenance.yaml) for a complete external jobs file.
+
+Relative `job_files.path` values are resolved relative to the main config file. Jobs loaded from a job file keep the file's `name` as their `group` in the HTTP status response, and inherit any environment variables from that file's optional top-level `env` map. Missing job UUIDs are written back to the file that defined the job, not necessarily the main config.
 
 ## Run the service
 

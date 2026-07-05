@@ -255,6 +255,7 @@ async fn run_job_inner(
     command
         .arg("-c")
         .arg(&job.command)
+        .envs(&job.env)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -551,6 +552,7 @@ mod tests {
             // 1-second job finishes, so this test stays fast.
             alert_if_running_for_longer_than: Some("0s".to_string()),
             group: None,
+            env: HashMap::new(),
             source_path: None,
         };
         let history = HistoryDb::open(temp.path()).await.unwrap();
@@ -602,6 +604,7 @@ mod tests {
             trigger: JobTrigger::Manual,
             alert_if_running_for_longer_than: None,
             group: None,
+            env: HashMap::new(),
             source_path: None,
         };
         let history = HistoryDb::open(temp.path()).await.unwrap();
@@ -635,5 +638,61 @@ mod tests {
         let log = tokio::fs::read_to_string(log_path).await.unwrap();
 
         assert!(log.contains("[stdout] expanded"));
+    }
+
+    #[tokio::test]
+    async fn run_job_inner_passes_group_env_to_command() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let mut env = HashMap::new();
+        env.insert("SUNDIALD_GROUP_VALUE".to_string(), "from-group".to_string());
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "env-group".to_string(),
+            command: "printf '%s\\n' \"$SUNDIALD_GROUP_VALUE\"".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: Some("ops".to_string()),
+            env,
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let log_dir = temp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+
+        run_job_inner(
+            job,
+            log_dir,
+            temp.path().join("sundiald.log"),
+            alert,
+            temp.path().to_path_buf(),
+            history,
+            Arc::clone(&state),
+            control_rx,
+            false,
+            RunTrigger::Manual,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = state.lock().await;
+        let log_path = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.uuid == job_id)
+            .and_then(|job| job.log_path.as_ref())
+            .expect("completed job should have a log path");
+        let log = tokio::fs::read_to_string(log_path).await.unwrap();
+
+        assert!(log.contains("[stdout] from-group"));
     }
 }

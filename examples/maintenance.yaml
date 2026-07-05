@@ -1,0 +1,15 @@
+env:
+  APP_ENV: production
+  REPORT_ROOT: /srv/reports
+jobs:
+  - name: rotate-logs
+    command: "/usr/local/bin/rotate-app-logs"
+    trigger:
+      schedule: "0 0 3 * * *"
+  - name: rebuild-report
+    command: "/usr/local/bin/rebuild-report"
+    trigger: manual
+  - name: publish-report
+    command: "/usr/local/bin/publish-report"
+    trigger:
+      after: rebuild-report

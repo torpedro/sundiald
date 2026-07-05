@@ -409,6 +409,7 @@ mod tests {
             trigger: JobTrigger::Manual,
             alert_if_running_for_longer_than: None,
             group: Some("ops".to_string()),
+            env: std::collections::HashMap::new(),
             source_path: None,
         };
 

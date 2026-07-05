@@ -30,15 +30,32 @@ pub struct SundialdConfig {
     #[serde(default)]
     pub alert: AlertConfig,
     #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
     pub job_files: Vec<JobFileConfig>,
     #[serde(default)]
     pub jobs: Vec<JobConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobFileConfig {
     pub name: String,
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobFileContents {
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    pub jobs: Vec<JobConfig>,
+}
+
+impl JobFileContents {
+    fn into_parts(self) -> (HashMap<String, String>, Vec<JobConfig>) {
+        (self.env, self.jobs)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -101,6 +118,9 @@ pub struct JobConfig {
     /// Display grouping for jobs loaded from a named external job file.
     #[serde(skip)]
     pub group: Option<String>,
+    /// Environment inherited from the named external job file group.
+    #[serde(skip)]
+    pub env: HashMap<String, String>,
     /// YAML file this job came from, used to persist generated UUIDs back to
     /// the right source file without re-serializing unrelated config.
     #[serde(skip)]
@@ -223,6 +243,7 @@ impl SundialdConfig {
 
     fn load_job_files(&mut self, config_path: &Path) -> Result<()> {
         for job in &mut self.jobs {
+            job.env = self.env.clone();
             job.source_path = Some(config_path.to_path_buf());
         }
 
@@ -231,10 +252,16 @@ impl SundialdConfig {
             let path = resolve_path(config_dir, &job_file.path);
             let raw = fs::read_to_string(&path)
                 .with_context(|| format!("failed to read job file {}", path.display()))?;
-            let mut jobs: Vec<JobConfig> = serde_yaml::from_str(&raw)
+            let contents: JobFileContents = serde_yaml::from_str(&raw)
                 .with_context(|| format!("failed to parse job file {}", path.display()))?;
+            let (env, mut jobs) = contents.into_parts();
+            validate_env(
+                &env,
+                &format!("job file '{}' ({})", job_file.name, path.display()),
+            )?;
             for job in &mut jobs {
                 job.group = Some(job_file.name.clone());
+                job.env = env.clone();
                 job.source_path = Some(path.clone());
             }
             self.jobs.extend(jobs);
@@ -261,6 +288,8 @@ impl SundialdConfig {
                 }
             }
         }
+
+        validate_env(&self.env, "root config")?;
 
         let mut job_file_names = HashSet::new();
         for job_file in &self.job_files {
@@ -388,6 +417,18 @@ impl SundialdConfig {
     }
 }
 
+fn validate_env(env: &HashMap<String, String>, context: &str) -> Result<()> {
+    for key in env.keys() {
+        if key.trim().is_empty() {
+            bail!("{context} env contains an empty key");
+        }
+        if key.contains('=') {
+            bail!("{context} env key '{key}' cannot contain '='");
+        }
+    }
+    Ok(())
+}
+
 fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -476,11 +517,14 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
+# Environment variables inherited by inline jobs in this file.
+env:
+  APP_ENV: production
 # Optional named files containing additional job definitions.
-# Each file is a YAML list of jobs, using the same shape as entries under `jobs`.
+# Each file is a YAML map with optional `env` and a required `jobs` list.
 # job_files:
 #   - name: maintenance
-#     path: jobs/maintenance.yaml
+#     path: maintenance.yaml
 jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541
@@ -663,10 +707,11 @@ jobs:
         std::fs::write(
             jobs_dir.join("maintenance.yaml"),
             r#"
-- name: cleanup
-  command: "true"
-  trigger:
-    schedule: "0 0 * * * *"
+jobs:
+  - name: cleanup
+    command: "true"
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .unwrap();
@@ -693,17 +738,127 @@ job_files:
     }
 
     #[test]
+    fn config_rejects_bare_list_external_job_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let external_path = temp.path().join("ops.yaml");
+        std::fs::write(
+            &external_path,
+            r#"
+- name: cleanup
+  command: "true"
+  trigger: manual
+"#,
+        )
+        .unwrap();
+        let config_path = temp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+job_files:
+  - name: ops
+    path: ops.yaml
+"#,
+        )
+        .unwrap();
+
+        let error = SundialdConfig::load(&config_path).unwrap_err();
+
+        assert!(format!("{error:#}").contains("failed to parse job file"));
+    }
+
+    #[test]
+    fn config_applies_external_jobs_section_env_to_loaded_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let external_path = temp.path().join("ops.yaml");
+        std::fs::write(
+            &external_path,
+            r#"
+env:
+  APP_ENV: production
+  REPORT_ROOT: /srv/reports
+jobs:
+  - name: cleanup
+    command: "true"
+    trigger: manual
+"#,
+        )
+        .unwrap();
+        let config_path = temp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+job_files:
+  - name: ops
+    path: ops.yaml
+"#,
+        )
+        .unwrap();
+
+        let config = SundialdConfig::load(&config_path).unwrap();
+
+        assert_eq!(
+            config.jobs[0].env.get("APP_ENV").map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(
+            config.jobs[0].env.get("REPORT_ROOT").map(String::as_str),
+            Some("/srv/reports")
+        );
+    }
+
+    #[test]
+    fn config_applies_root_env_to_inline_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("config.yaml");
+        std::fs::write(
+            &config_path,
+            r#"
+env:
+  APP_ENV: development
+jobs:
+  - name: heartbeat
+    command: "true"
+    trigger: manual
+"#,
+        )
+        .unwrap();
+
+        let config = SundialdConfig::load(&config_path).unwrap();
+
+        assert_eq!(
+            config.jobs[0].env.get("APP_ENV").map(String::as_str),
+            Some("development")
+        );
+    }
+
+    #[test]
+    fn config_rejects_env_on_job_file_reference() {
+        let config = serde_yaml::from_str::<SundialdConfig>(
+            r#"
+job_files:
+  - name: ops
+    path: ops.yaml
+    env:
+      APP_ENV: production
+"#,
+        );
+
+        assert!(config.is_err());
+    }
+
+    #[test]
     fn load_and_ensure_ids_patches_the_external_job_file_that_defined_the_job() {
         let temp = tempfile::tempdir().unwrap();
         let external_path = temp.path().join("ops.yaml");
         std::fs::write(
             &external_path,
             r#"
-- name: rotate-logs
-  # keep this comment next to the job definition
-  command: "true"
-  trigger:
-    schedule: "0 0 * * * *"
+jobs:
+  - name: rotate-logs
+    # keep this comment next to the job definition
+    command: "true"
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .unwrap();
@@ -723,8 +878,8 @@ job_files:
         let root_config = std::fs::read_to_string(&config_path).unwrap();
 
         assert!(config.jobs[0].uuid.is_some());
-        assert!(patched_external.contains("  uuid: "));
-        assert!(patched_external.contains("  # keep this comment"));
+        assert!(patched_external.contains("    uuid: "));
+        assert!(patched_external.contains("    # keep this comment"));
         assert!(!root_config.contains("uuid:"));
     }
 
@@ -760,5 +915,28 @@ alert:
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/sundiald.yaml");
         let example = std::fs::read_to_string(example_path).unwrap();
         assert_eq!(sample_config(), example);
+    }
+
+    #[test]
+    fn external_jobs_example_uses_supported_format() {
+        let example_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/maintenance.yaml");
+        let example = std::fs::read_to_string(example_path).unwrap();
+        let contents: JobFileContents = serde_yaml::from_str(&example).unwrap();
+        let (env, jobs) = contents.into_parts();
+        let config = SundialdConfig {
+            state_dir: default_state_dir(),
+            log_dir: default_log_dir(),
+            service_log: default_service_log(),
+            api_bind: default_api_bind(),
+            log_retention_days: default_log_retention_days(),
+            alert: AlertConfig::default(),
+            env: HashMap::new(),
+            job_files: Vec::new(),
+            jobs,
+        };
+
+        assert_eq!(env.get("APP_ENV").map(String::as_str), Some("production"));
+        assert!(config.validate().is_ok());
     }
 }

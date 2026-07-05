@@ -21,10 +21,13 @@ alert:
   #   title: "sundiald"
   #   priority: 0
 # Optional named files containing additional job definitions.
-# Each file is a YAML list of jobs, using the same shape as entries under `jobs`.
+# Each file is a YAML map with optional `env` and a required `jobs` list.
 # job_files:
 #   - name: maintenance
-#     path: jobs/maintenance.yaml
+#     path: maintenance.yaml
+# Environment variables inherited by inline jobs in this file.
+env:
+  APP_ENV: production
 jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541

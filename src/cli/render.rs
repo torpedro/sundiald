@@ -74,7 +74,7 @@ pub(crate) async fn render_status(
     Ok((output, status.jobs))
 }
 
-fn group_jobs(
+pub(crate) fn group_jobs(
     jobs: &[service::JobStatusResponse],
 ) -> Vec<(Option<String>, Vec<(usize, &service::JobStatusResponse)>)> {
     let mut groups: Vec<(Option<String>, Vec<(usize, &service::JobStatusResponse)>)> = Vec::new();
@@ -89,7 +89,7 @@ fn group_jobs(
     groups
 }
 
-fn high_level_status(job: &service::JobStatusResponse) -> &'static str {
+pub(crate) fn high_level_status(job: &service::JobStatusResponse) -> &'static str {
     match &job.status {
         state::JobStatus::Running => "running",
         state::JobStatus::Failed | state::JobStatus::StartFailed => "last run failed",
@@ -143,7 +143,7 @@ fn colored_status(job: &service::JobStatusResponse) -> String {
 /// completed run, "running for X" while still active, or just the "ago"
 /// timestamp with no duration when the run length isn't known (e.g.
 /// interrupted before finishing).
-fn format_last_run(job: &service::JobStatusResponse, now: DateTime<Local>) -> String {
+pub(crate) fn format_last_run(job: &service::JobStatusResponse, now: DateTime<Local>) -> String {
     if matches!(job.status, state::JobStatus::Running) {
         let Some(started) = job.started_at else {
             return "never".to_string();
@@ -175,6 +175,34 @@ fn format_next_run(job: &service::JobStatusResponse, now: DateTime<Local>) -> St
                 .after
                 .as_deref()
                 .map(|upstream| format!("after {upstream}").cyan().to_string())
+                .unwrap_or_else(|| "after unknown".to_string());
+        }
+        _ => {}
+    }
+
+    job.next_run
+        .map(|time| {
+            format!(
+                "{} (in {})",
+                format_timestamp(time),
+                format_duration(time.signed_duration_since(now))
+            )
+        })
+        .unwrap_or_else(|| "none found".to_string())
+}
+
+pub(crate) fn format_next_run_plain(
+    job: &service::JobStatusResponse,
+    now: DateTime<Local>,
+) -> String {
+    match job.trigger.kind.as_str() {
+        "manual" => return "manual".to_string(),
+        "dependency" => {
+            return job
+                .trigger
+                .after
+                .as_deref()
+                .map(|upstream| format!("after {upstream}"))
                 .unwrap_or_else(|| "after unknown".to_string());
         }
         _ => {}

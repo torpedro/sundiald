@@ -6,11 +6,11 @@ use serde::Deserialize;
 pub struct Schedule {
     #[serde(default)]
     pub manual_only: bool,
-    #[serde(default = "zero")]
+    #[serde(default)]
     pub seconds: Vec<String>,
-    #[serde(default = "star")]
+    #[serde(default)]
     pub minutes: Vec<String>,
-    #[serde(default = "star")]
+    #[serde(default)]
     pub hours: Vec<String>,
     #[serde(default = "star")]
     pub days_of_week: Vec<String>,
@@ -25,6 +25,9 @@ impl Schedule {
         if self.manual_only {
             return Ok(());
         }
+        require_field(&self.seconds, "seconds")?;
+        require_field(&self.minutes, "minutes")?;
+        require_field(&self.hours, "hours")?;
         parse_field(&self.seconds, 0, 59, &[])?;
         parse_field(&self.minutes, 0, 59, &[])?;
         parse_field(&self.hours, 0, 23, &[])?;
@@ -192,6 +195,13 @@ fn parse_field(values: &[String], min: u32, max: u32, aliases: &[(&str, u32)]) -
     Ok(())
 }
 
+fn require_field(values: &[String], name: &str) -> Result<()> {
+    if values.is_empty() {
+        bail!("schedule field '{name}' is required for non-manual jobs");
+    }
+    Ok(())
+}
+
 fn expand_part(part: &str, min: u32, max: u32, aliases: &[(&str, u32)]) -> Result<Vec<u32>> {
     if part.is_empty() {
         bail!("empty schedule field");
@@ -270,10 +280,6 @@ fn star() -> Vec<String> {
     vec!["*".to_string()]
 }
 
-fn zero() -> Vec<String> {
-    vec!["0".to_string()]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -330,7 +336,7 @@ mod tests {
     }
 
     #[test]
-    fn schedule_defaults_to_second_zero() {
+    fn schedule_requires_seconds_minutes_and_hours_for_non_manual_jobs() {
         let config: crate::config::SundialdConfig = serde_yaml::from_str(
             r#"
 jobs:
@@ -343,6 +349,26 @@ jobs:
         .unwrap();
         let schedule = &config.jobs[0].schedule;
 
+        assert!(schedule.validate().is_err());
+    }
+
+    #[test]
+    fn schedule_keeps_day_and_month_defaults() {
+        let config: crate::config::SundialdConfig = serde_yaml::from_str(
+            r#"
+jobs:
+  - name: every-minute
+    command: "true"
+    schedule:
+      seconds: ["0"]
+      minutes: ["*"]
+      hours: ["*"]
+"#,
+        )
+        .unwrap();
+        let schedule = &config.jobs[0].schedule;
+
+        assert!(schedule.validate().is_ok());
         assert!(schedule.matches(Local.with_ymd_and_hms(2026, 7, 3, 9, 30, 0).unwrap()));
         assert!(!schedule.matches(Local.with_ymd_and_hms(2026, 7, 3, 9, 30, 1).unwrap()));
     }

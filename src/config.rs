@@ -217,6 +217,14 @@ impl SundialdConfig {
         Ok(())
     }
 
+    pub fn absolutize_runtime_paths(&mut self, base: &Path) {
+        self.state_dir = resolve_path(base, &self.state_dir);
+        self.log_dir = resolve_path(base, &self.log_dir);
+        self.service_log = resolve_path(base, &self.service_log);
+        self.alert.log = resolve_path(base, &self.alert.log);
+        self.alert.event_dir = resolve_path(base, &self.alert.event_dir);
+    }
+
     /// Like `load`, but also assigns a fresh UUID to any job missing one and
     /// persists it back to the YAML file that defined that job before
     /// returning — a minimal, targeted text patch that inserts `uuid: <uuid>` lines rather than
@@ -409,7 +417,9 @@ jobs:
   - name: failing-job
     command: "false"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
 "#,
         )
         .unwrap();
@@ -446,7 +456,9 @@ jobs:
     command: "true"
     alert_if_running_for_longer_than: "not-a-duration"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
 "#,
         )
         .unwrap();
@@ -463,7 +475,9 @@ jobs:
     command: "true"
     alert_if_running_for_longer_than: "10m"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
 "#,
         )
         .unwrap();
@@ -486,7 +500,9 @@ jobs:
 - name: cleanup
   command: "true"
   schedule:
+    seconds: ["0"]
     minutes: ["0"]
+    hours: ["*"]
 "#,
         )
         .unwrap();
@@ -523,7 +539,9 @@ job_files:
   # keep this comment next to the job definition
   command: "true"
   schedule:
+    seconds: ["0"]
     minutes: ["0"]
+    hours: ["*"]
 "#,
         )
         .unwrap();
@@ -546,6 +564,30 @@ job_files:
         assert!(patched_external.contains("  uuid: "));
         assert!(patched_external.contains("  # keep this comment"));
         assert!(!root_config.contains("uuid:"));
+    }
+
+    #[test]
+    fn absolutize_runtime_paths_resolves_paths_against_the_service_cwd() {
+        let mut config: SundialdConfig = serde_yaml::from_str(
+            r#"
+state_dir: state
+log_dir: logs
+service_log: service.log
+alert:
+  log: alerts.log
+  event_dir: alerts
+"#,
+        )
+        .unwrap();
+        let base = std::path::Path::new("/srv/sundiald");
+
+        config.absolutize_runtime_paths(base);
+
+        assert_eq!(config.state_dir, base.join("state"));
+        assert_eq!(config.log_dir, base.join("logs"));
+        assert_eq!(config.service_log, base.join("service.log"));
+        assert_eq!(config.alert.log, base.join("alerts.log"));
+        assert_eq!(config.alert.event_dir, base.join("alerts"));
     }
 
     #[test]

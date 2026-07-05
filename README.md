@@ -75,7 +75,7 @@ jobs:
       manual_only: true
 ```
 
-Schedule fields accept `*`, exact numbers, ranges like `1-5`, steps like `*/15`, and comma-separated values like `1,15,30`. Seconds and minutes use `0` through `59`; hours use `0` through `23`. Weekdays accept `mon` through `sun`; months accept `jan` through `dec` or `1` through `12`. If `seconds` is omitted, it defaults to `["0"]` so older minute-based schedules still run once per matching minute. Set `manual_only: true` in a schedule to disable scheduled runs while keeping manual runs available.
+Schedule fields accept `*`, exact numbers, ranges like `1-5`, steps like `*/15`, and comma-separated values like `1,15,30`. For non-manual jobs, `seconds`, `minutes`, and `hours` are required. Seconds and minutes use `0` through `59`; hours use `0` through `23`. Weekdays accept `mon` through `sun`; months accept `jan` through `dec` or `1` through `12`. Day and month fields default to `["*"]` when omitted. Set `manual_only: true` in a schedule to disable scheduled runs while keeping manual runs available.
 
 If both `days_of_week` and `days_of_month` are restricted (not left as `*`), a day matches when *either* is satisfied, matching standard cron semantics — e.g. `days_of_month: ["1"]` plus `days_of_week: ["mon"]` runs on the 1st of the month *or* on Mondays, not only on a Monday that happens to be the 1st. If only one of the two is restricted, only that one applies.
 
@@ -85,7 +85,7 @@ Set a job's optional `alert_if_running_for_longer_than` (e.g. `"45s"`, `"10m"`, 
 
 Job log files under `log_dir` and alert event JSON files under `alert.event_dir` are pruned automatically based on `log_retention_days` and `alert.retention_days` (checked once at startup and then hourly). Set either to `0` to keep files forever.
 
-Each job has a stable `uuid` used internally to track it across renames — `name` is just a label. You don't need to set `uuid` by hand: `serve` (and `reload`) generate one for any job missing it and write it back into the YAML file in place, next to that job's `name`, without disturbing comments or formatting elsewhere in the file. As long as you keep the `uuid` line when you rename a job, the service recognizes it as the same job across the rename — its live/last run status carries over under the new name instead of resetting. Removing a job from the config entirely (not renaming it) while it's still running leaves it visible in `status` and controllable by its last-known name until it finishes, since there's no new name to carry it forward to.
+Each job has a stable `uuid` used internally to track it across renames — `name` is just a label. You don't need to set `uuid` by hand: `daemon` (and `reload`) generate one for any job missing it and write it back into the YAML file in place, next to that job's `name`, without disturbing comments or formatting elsewhere in the file. As long as you keep the `uuid` line when you rename a job, the service recognizes it as the same job across the rename — its live/last run status carries over under the new name instead of resetting. Removing a job from the config entirely (not renaming it) while it's still running leaves it visible in `status` and controllable by its last-known name until it finishes, since there's no new name to carry it forward to.
 
 Use `job_files` to split job definitions into named external files:
 
@@ -103,6 +103,7 @@ Each referenced file is a YAML list of job definitions:
 - name: rotate-logs
   command: "/usr/local/bin/rotate-app-logs"
   schedule:
+    seconds: ["0"]
     minutes: ["0"]
     hours: ["3"]
 - name: rebuild-report
@@ -116,7 +117,7 @@ Relative `job_files.path` values are resolved relative to the main config file. 
 ## Run the service
 
 ```sh
-cargo run -- serve
+cargo run -- daemon
 ```
 
 When `--config` is not supplied, sundiald reads `~/.config/sundiald/config.yaml`. Pass `--config <path>` to use a different config file.
@@ -174,7 +175,7 @@ Wants=network-online.target
 Type=simple
 User=sundiald
 Group=sundiald
-ExecStart=/usr/local/bin/sundiald serve --config /etc/sundiald/sundiald.yaml
+ExecStart=/usr/local/bin/sundiald daemon --config /etc/sundiald/sundiald.yaml
 Restart=on-failure
 RestartSec=5s
 
@@ -193,7 +194,7 @@ sudo systemctl status sundiald
 Use the installed binary to inspect or control the running service:
 
 ```sh
-sundiald status --config /etc/sundiald/sundiald.yaml
+sundiald ui --config /etc/sundiald/sundiald.yaml
 sundiald reload --config /etc/sundiald/sundiald.yaml
 sundiald run heartbeat --config /etc/sundiald/sundiald.yaml
 ```
@@ -207,17 +208,17 @@ cargo run -- config
 cargo run -- run heartbeat
 cargo run -- terminate sleepy
 cargo run -- kill sleepy
-cargo run -- status
-cargo run -- status --watch
+cargo run -- ui
+cargo run -- ui --once
 ```
 
-In watch mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
+The `ui` command opens the interactive view by default. Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
 
-Manual runs are requested through the HTTP API and executed by the long-running `serve` process, so ad-hoc jobs are still child processes of the main sundiald service.
+Manual runs are requested through the HTTP API and executed by the long-running `daemon` process, so ad-hoc jobs are still child processes of the main sundiald service.
 
 ## HTTP API
 
-`serve` starts a local HTTP API at `api_bind`.
+`daemon` starts a local HTTP API at `api_bind`.
 
 ```sh
 curl http://127.0.0.1:8787/status
@@ -227,6 +228,6 @@ curl -X POST http://127.0.0.1:8787/jobs/sleepy/kill
 curl -X POST http://127.0.0.1:8787/reload
 ```
 
-The CLI uses this API for `status`, `status --watch`, `run`/`terminate`/`kill`, and `reload`, so the same surface can back a web UI later.
+The CLI uses this API for `ui`, `run`/`terminate`/`kill`, and `reload`, so the same surface can back a web UI later.
 
 `/status` reports a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted` (was `running` when the service last restarted) per job, plus a `terminated_by_signal` field (`"SIGTERM"`/`"SIGKILL"`/`null`) when a run ended because it was signaled via `terminate`/`kill` rather than exiting on its own, a `uuid` field with the job's stable identity, and a `group` field for jobs loaded from a named job file.

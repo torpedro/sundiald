@@ -214,7 +214,7 @@ struct WatchTerminal;
 impl WatchTerminal {
     fn enter() -> Result<Self> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            anyhow::bail!("status --watch requires an interactive terminal");
+            anyhow::bail!("ui requires an interactive terminal; use `ui --once` for plain output");
         }
         crossterm::terminal::enable_raw_mode()?;
         let mut stdout = io::stdout().lock();

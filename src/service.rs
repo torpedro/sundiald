@@ -7,7 +7,7 @@ mod process;
 
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -77,7 +77,12 @@ pub(crate) async fn log_service_event(service_log: &PathBuf, line: String, emit_
     }
 }
 
-pub async fn run(config: SundialdConfig, config_path: PathBuf) -> Result<()> {
+pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()> {
+    let runtime_base =
+        std::env::current_dir().context("failed to resolve sundiald working directory")?;
+    config.absolutize_runtime_paths(&runtime_base);
+    let config_path = absolutize_path(&runtime_base, &config_path);
+
     fs::create_dir_all(&config.state_dir).await?;
     fs::create_dir_all(&config.log_dir).await?;
     fs::create_dir_all(&config.alert.event_dir).await?;
@@ -285,4 +290,12 @@ async fn handle_manual_request(
 
 fn retain_running(running: &mut HashMap<Uuid, RunningJob>) {
     running.retain(|_, running_job| !running_job.handle.is_finished());
+}
+
+fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
 }

@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -115,7 +115,20 @@ async fn api_status(State(api): State<ApiState>) -> Json<StatusResponse> {
 /// user-triggered action rather than a fire-and-forget signal.
 async fn api_reload(State(api): State<ApiState>) -> Response {
     match SundialdConfig::load_and_ensure_ids(&api.config_path) {
-        Ok(new_config) => {
+        Ok(mut new_config) => {
+            let runtime_base = match std::env::current_dir() {
+                Ok(path) => path,
+                Err(error) => {
+                    let message = format!("failed to resolve sundiald working directory: {error}");
+                    eprintln!("{message}");
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "reloaded": false, "error": message })),
+                    )
+                        .into_response();
+                }
+            };
+            new_config.absolutize_runtime_paths(&runtime_base);
             let job_count = new_config.jobs.len();
             let _ = fs::create_dir_all(&new_config.state_dir).await;
             let _ = fs::create_dir_all(&new_config.log_dir).await;
@@ -307,6 +320,7 @@ async fn enqueue_manual_request(api: &ApiState, job: &str) -> std::result::Resul
 
 pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
     let now = Local::now();
+    let runtime_base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = api.config.read().await.clone();
     let snapshot = api.state.lock().await.clone();
     let pending = api.pending_manual.lock().await.clone();
@@ -335,7 +349,9 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                 started_at: state.and_then(|state| state.started_at),
                 finished_at: state.and_then(|state| state.finished_at),
                 exit_code: state.and_then(|state| state.exit_code),
-                log_path: state.and_then(|state| state.log_path.clone()),
+                log_path: state
+                    .and_then(|state| state.log_path.clone())
+                    .map(|path| absolutize_path(&runtime_base, &path)),
                 last_error: state.and_then(|state| state.last_error.clone()),
                 terminated_by_signal: state.and_then(|state| state.terminated_by_signal.clone()),
                 next_run: job.schedule.next_runs(now, 1).into_iter().next(),
@@ -363,7 +379,10 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
             started_at: state.started_at,
             finished_at: state.finished_at,
             exit_code: state.exit_code,
-            log_path: state.log_path.clone(),
+            log_path: state
+                .log_path
+                .clone()
+                .map(|path| absolutize_path(&runtime_base, &path)),
             last_error: Some(
                 "orphaned: no longer in the reloaded config, but was still running when reloaded"
                     .to_string(),
@@ -378,6 +397,14 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
     StatusResponse {
         updated_at: Local::now(),
         jobs,
+    }
+}
+
+fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
     }
 }
 
@@ -531,6 +558,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_status_returns_absolute_log_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path().to_path_buf());
+        let job_id = config.jobs[0].uuid.unwrap();
+        let mut snapshot = StateSnapshot::new(vec![(job_id, "sleepy".to_string())]);
+        let mut state = running_job_state(job_id, "sleepy");
+        state.log_path = Some(PathBuf::from(".sundiald/logs/sleepy.log"));
+        snapshot.upsert(state);
+        let api = test_api(config, snapshot);
+
+        let status = build_status_response(&api).await;
+
+        let log_path = status.jobs[0].log_path.as_ref().unwrap();
+        assert!(log_path.is_absolute());
+        assert!(log_path.ends_with(".sundiald/logs/sleepy.log"));
+    }
+
+    #[tokio::test]
     async fn api_kill_endpoint_sends_sigkill_control() {
         let temp = tempfile::tempdir().unwrap();
         let config = test_config(temp.path().to_path_buf());
@@ -671,7 +716,9 @@ jobs:
   - name: original
     command: "true"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
 "#,
         )
         .await
@@ -698,11 +745,15 @@ jobs:
   - name: reloaded
     command: "true"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
   - name: second
     command: "true"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
 "#,
         )
         .await
@@ -738,7 +789,9 @@ jobs:
   - name: original
     command: "true"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
 "#,
         )
         .await
@@ -764,11 +817,15 @@ jobs:
   - name: original
     command: "true"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
   - name: original
     command: "true"
     schedule:
+      seconds: ["0"]
       minutes: ["0"]
+      hours: ["*"]
 "#,
         )
         .await

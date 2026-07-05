@@ -19,8 +19,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the long-lived job runner service.
-    Serve {
+    /// Run the long-lived job runner daemon.
+    Daemon {
         /// YAML config file to load.
         #[arg(short, long)]
         config: Option<PathBuf>,
@@ -61,14 +61,14 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
-    /// Show configured jobs, high-level run status, last run, and next run.
-    Status {
+    /// Open the interactive status UI.
+    Ui {
         /// YAML config file to inspect.
         #[arg(short, long)]
         config: Option<PathBuf>,
-        /// Keep status live and refresh every second.
-        #[arg(short, long)]
-        watch: bool,
+        /// Print one status frame instead of opening the interactive UI.
+        #[arg(long)]
+        once: bool,
     },
     /// Print a starter YAML config.
     SampleConfig,
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Serve {
+        Command::Daemon {
             config: config_path,
         } => {
             let config_path = resolve_config_path(config_path);
@@ -169,13 +169,13 @@ async fn main() -> Result<()> {
             let config = SundialdConfig::load(&config)?;
             cli::reload_config(&config).await
         }
-        Command::Status { config, watch } => {
+        Command::Ui { config, once } => {
             let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
-            if watch {
-                cli::watch_status(config).await?;
-            } else {
+            if once {
                 cli::print_status(&config).await?;
+            } else {
+                cli::watch_status(config).await?;
             }
             Ok(())
         }

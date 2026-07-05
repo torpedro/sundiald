@@ -21,13 +21,24 @@ pub(crate) async fn render_status(
 
     let mut output = String::new();
     let groups = group_jobs(&status.jobs);
-    for (group_index, (group, jobs)) in groups.iter().enumerate() {
-        if group_index > 0 {
-            output.push_str("----\n");
+    let mut rendered_any_job = false;
+    for (group, jobs) in &groups {
+        let mut printed_group_header = false;
+        if let Some(group) = group {
+            if rendered_any_job {
+                output.push_str("----\n");
+            }
+            output.push_str(&format!("{}\n", group.bold()));
+            printed_group_header = true;
         }
-        output.push_str(&format!("{}\n", group_label(group).bold()));
 
         for &(index, job) in jobs {
+            if rendered_any_job && !printed_group_header {
+                output.push_str("----\n");
+            }
+            printed_group_header = false;
+            rendered_any_job = true;
+
             let is_selected = selected == Some(index);
             let marker = if is_selected {
                 "> "
@@ -51,11 +62,13 @@ pub(crate) async fn render_status(
     if let Some(last_command) = last_command {
         output.push('\n');
         output.push_str(
-            "keys: arrows/j/k select, Enter log, h history, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, q quit",
+            "keys: arrows/j/k select, Enter log, h history, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, Del clear, q quit",
         );
         output.push('\n');
-        output.push_str(last_command);
-        output.push('\n');
+        if !last_command.is_empty() {
+            output.push_str(last_command);
+            output.push('\n');
+        }
     }
 
     Ok((output, status.jobs))
@@ -74,10 +87,6 @@ fn group_jobs(
         }
     }
     groups
-}
-
-fn group_label(group: &Option<String>) -> &str {
-    group.as_deref().unwrap_or("inline")
 }
 
 fn high_level_status(job: &service::JobStatusResponse) -> &'static str {

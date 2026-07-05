@@ -443,15 +443,19 @@ enum ApiError {
 }
 
 async fn enqueue_manual_request(api: &ApiState, job: &str) -> std::result::Result<(), ApiError> {
-    let uuid = api
+    let uuid = resolve_job_id(api, job).await;
+    let Some(uuid) = uuid else {
+        return Err(ApiError::UnknownJob(format!("unknown job '{job}'")));
+    };
+    let job_name = api
         .config
         .read()
         .await
         .jobs
         .iter()
-        .find(|candidate| candidate.name == job)
-        .and_then(|candidate| candidate.uuid);
-    let Some(uuid) = uuid else {
+        .find(|candidate| candidate.uuid == Some(uuid))
+        .map(|candidate| candidate.name.clone());
+    let Some(job_name) = job_name else {
         return Err(ApiError::UnknownJob(format!("unknown job '{job}'")));
     };
 
@@ -470,15 +474,15 @@ async fn enqueue_manual_request(api: &ApiState, job: &str) -> std::result::Resul
 
     {
         let mut pending = api.pending_manual.lock().await;
-        if !pending.insert(job.to_string()) {
+        if !pending.insert(job_name.clone()) {
             return Err(ApiError::Conflict(format!(
-                "job '{job}' already has a pending manual run request"
+                "job '{job_name}' already has a pending manual run request"
             )));
         }
     }
 
-    if api.manual_tx.send(job.to_string()).is_err() {
-        api.pending_manual.lock().await.remove(job);
+    if api.manual_tx.send(job_name.clone()).is_err() {
+        api.pending_manual.lock().await.remove(&job_name);
         return Err(ApiError::Unavailable(
             "service is not accepting manual run requests".to_string(),
         ));
@@ -745,6 +749,29 @@ mod tests {
 
         let response = client
             .post(format!("http://{addr}/jobs/sleepy/run"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(manual_rx.recv().await.unwrap(), "sleepy");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn api_manual_run_endpoint_accepts_job_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path().to_path_buf());
+        let job_id = config.jobs[0].uuid.unwrap();
+        let snapshot = StateSnapshot::new(vec![(job_id, "sleepy".to_string())]);
+        let (manual_tx, mut manual_rx) = mpsc::unbounded_channel();
+        let api = test_api_with_sender(config, snapshot, manual_tx);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_api_on_listener(listener, api));
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/jobs/{job_id}/run"))
             .send()
             .await
             .unwrap();

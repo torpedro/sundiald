@@ -112,6 +112,9 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                             last_command = read_recent_log(&config, job).await;
                         }
                     }
+                    KeyCode::Delete => {
+                        last_command.clear();
+                    }
                     _ => {}
                 }
                 jobs = redraw_status(&config, Some(selected), Some(&last_command)).await?;

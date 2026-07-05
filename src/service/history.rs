@@ -48,33 +48,12 @@ impl HistoryDb {
         let path = self.path.clone();
         run_blocking(move || {
             let connection = open_connection(&path)?;
-            connection.execute_batch(
-                r#"
-                CREATE TABLE IF NOT EXISTS job_runs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_uuid TEXT NOT NULL,
-                    job_name TEXT NOT NULL,
-                    job_group TEXT,
-                    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('automatic', 'manual')),
-                    triggered_at TEXT NOT NULL,
-                    finished_at TEXT,
-                    duration_ms INTEGER,
-                    exit_code INTEGER,
-                    log_path TEXT,
-                    status TEXT,
-                    terminated_by_signal TEXT,
-                    error TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_job_runs_job_uuid_triggered_at
-                    ON job_runs(job_uuid, triggered_at);
-                CREATE INDEX IF NOT EXISTS idx_job_runs_triggered_at
-                    ON job_runs(triggered_at);
-                "#,
-            )?;
+            connection.execute_batch(SCHEMA)?;
             ensure_column(&connection, "log_path", "TEXT")?;
             ensure_column(&connection, "status", "TEXT")?;
             ensure_column(&connection, "terminated_by_signal", "TEXT")?;
             ensure_column(&connection, "error", "TEXT")?;
+            migrate_trigger_kind_constraint(&connection)?;
             Ok(())
         })
         .await
@@ -84,7 +63,7 @@ impl HistoryDb {
         &self,
         job: &JobConfig,
         triggered_at: DateTime<Local>,
-        manual: bool,
+        trigger_kind: &str,
         log_path: &Path,
     ) -> Result<i64> {
         let path = self.path.clone();
@@ -94,7 +73,7 @@ impl HistoryDb {
             .to_string();
         let job_name = job.name.clone();
         let job_group = job.group.clone();
-        let trigger_kind = if manual { "manual" } else { "automatic" }.to_string();
+        let trigger_kind = trigger_kind.to_string();
         let triggered_at = triggered_at.to_rfc3339();
         let log_path = log_path.display().to_string();
 
@@ -234,6 +213,105 @@ impl HistoryDb {
     }
 }
 
+const SCHEMA: &str = r#"
+CREATE TABLE IF NOT EXISTS job_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_uuid TEXT NOT NULL,
+    job_name TEXT NOT NULL,
+    job_group TEXT,
+    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'dependency', 'manual')),
+    triggered_at TEXT NOT NULL,
+    finished_at TEXT,
+    duration_ms INTEGER,
+    exit_code INTEGER,
+    log_path TEXT,
+    status TEXT,
+    terminated_by_signal TEXT,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_job_runs_job_uuid_triggered_at
+    ON job_runs(job_uuid, triggered_at);
+CREATE INDEX IF NOT EXISTS idx_job_runs_triggered_at
+    ON job_runs(triggered_at);
+"#;
+
+fn migrate_trigger_kind_constraint(connection: &Connection) -> Result<()> {
+    let table_sql = connection
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'job_runs'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(table_sql) = table_sql else {
+        return Ok(());
+    };
+    if !table_sql.contains("'automatic'") {
+        return Ok(());
+    }
+
+    connection.execute_batch(
+        r#"
+        DROP INDEX IF EXISTS idx_job_runs_job_uuid_triggered_at;
+        DROP INDEX IF EXISTS idx_job_runs_triggered_at;
+        ALTER TABLE job_runs RENAME TO job_runs_old;
+        CREATE TABLE job_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_uuid TEXT NOT NULL,
+            job_name TEXT NOT NULL,
+            job_group TEXT,
+            trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'dependency', 'manual')),
+            triggered_at TEXT NOT NULL,
+            finished_at TEXT,
+            duration_ms INTEGER,
+            exit_code INTEGER,
+            log_path TEXT,
+            status TEXT,
+            terminated_by_signal TEXT,
+            error TEXT
+        );
+        INSERT INTO job_runs (
+            id,
+            job_uuid,
+            job_name,
+            job_group,
+            trigger_kind,
+            triggered_at,
+            finished_at,
+            duration_ms,
+            exit_code,
+            log_path,
+            status,
+            terminated_by_signal,
+            error
+        )
+        SELECT id,
+               job_uuid,
+               job_name,
+               job_group,
+               CASE trigger_kind
+                   WHEN 'automatic' THEN 'schedule'
+                   ELSE trigger_kind
+               END,
+               triggered_at,
+               finished_at,
+               duration_ms,
+               exit_code,
+               log_path,
+               status,
+               terminated_by_signal,
+               error
+        FROM job_runs_old;
+        DROP TABLE job_runs_old;
+        CREATE INDEX IF NOT EXISTS idx_job_runs_job_uuid_triggered_at
+            ON job_runs(job_uuid, triggered_at);
+        CREATE INDEX IF NOT EXISTS idx_job_runs_triggered_at
+            ON job_runs(triggered_at);
+        "#,
+    )?;
+    Ok(())
+}
+
 fn ensure_column(connection: &Connection, name: &str, sql_type: &str) -> Result<()> {
     let mut statement = connection.prepare("PRAGMA table_info(job_runs)")?;
     let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
@@ -316,7 +394,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Schedule;
+    use crate::config::JobTrigger;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -328,22 +406,14 @@ mod tests {
             uuid: Some(Uuid::new_v4()),
             name: "example".to_string(),
             command: "true".to_string(),
-            schedule: Schedule {
-                manual_only: true,
-                seconds: vec!["0".to_string()],
-                minutes: vec!["*".to_string()],
-                hours: vec!["*".to_string()],
-                days_of_week: vec!["*".to_string()],
-                days_of_month: vec!["*".to_string()],
-                months: vec!["*".to_string()],
-            },
+            trigger: JobTrigger::Manual,
             alert_if_running_for_longer_than: None,
             group: Some("ops".to_string()),
             source_path: None,
         };
 
         let run_id = history
-            .record_triggered(&job, started_at, true, &temp.path().join("example.log"))
+            .record_triggered(&job, started_at, "manual", &temp.path().join("example.log"))
             .await
             .unwrap();
         let finished_at = started_at + chrono::Duration::milliseconds(25);
@@ -404,5 +474,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(latest_log.ends_with("example.log"));
+    }
+
+    #[tokio::test]
+    async fn migrates_automatic_history_rows_to_schedule_trigger_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE job_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_uuid TEXT NOT NULL,
+                    job_name TEXT NOT NULL,
+                    job_group TEXT,
+                    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('automatic', 'manual')),
+                    triggered_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    duration_ms INTEGER,
+                    exit_code INTEGER
+                );
+                INSERT INTO job_runs (
+                    job_uuid,
+                    job_name,
+                    trigger_kind,
+                    triggered_at
+                ) VALUES (
+                    'a63d6b30-d69d-4e08-946e-1ad554d0d541',
+                    'heartbeat',
+                    'automatic',
+                    '2026-01-01T00:00:00+00:00'
+                );
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        let _history = HistoryDb::open(temp.path()).await.unwrap();
+        let connection = Connection::open(path).unwrap();
+        let trigger_kind: String = connection
+            .query_row("SELECT trigger_kind FROM job_runs", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(trigger_kind, "schedule");
     }
 }

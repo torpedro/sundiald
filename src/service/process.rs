@@ -28,6 +28,37 @@ pub(crate) enum JobControl {
     Signal(SignalKind),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum RunTrigger {
+    Schedule,
+    Dependency { upstream: String },
+    Manual,
+}
+
+impl RunTrigger {
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::Schedule => "schedule",
+            Self::Dependency { .. } => "dependency",
+            Self::Manual => "manual",
+        }
+    }
+
+    fn log_suffix(&self) -> String {
+        match self {
+            Self::Schedule => String::new(),
+            Self::Dependency { upstream } => format!(" trigger=dependency upstream={upstream}"),
+            Self::Manual => " trigger=manual".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct JobCompletion {
+    pub(crate) name: String,
+    pub(crate) success: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SignalKind {
     Term,
@@ -65,8 +96,9 @@ pub(crate) fn spawn_tracked_job(
     history: HistoryDb,
     state: Arc<Mutex<StateSnapshot>>,
     running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
+    completion_tx: mpsc::UnboundedSender<JobCompletion>,
     emit_stdout: bool,
-    manual: bool,
+    trigger: RunTrigger,
 ) -> RunningJob {
     let uuid = job
         .uuid
@@ -78,7 +110,7 @@ pub(crate) fn spawn_tracked_job(
             .lock()
             .await
             .insert(uuid, handle_control_tx);
-        run_job(
+        let completion = run_job(
             job,
             log_dir,
             service_log,
@@ -88,9 +120,10 @@ pub(crate) fn spawn_tracked_job(
             state,
             control_rx,
             emit_stdout,
-            manual,
+            trigger,
         )
         .await;
+        let _ = completion_tx.send(completion);
         running_controls.lock().await.remove(&uuid);
     });
 
@@ -107,9 +140,9 @@ async fn run_job(
     state: Arc<Mutex<StateSnapshot>>,
     control_rx: mpsc::UnboundedReceiver<JobControl>,
     emit_stdout: bool,
-    manual: bool,
-) {
-    if let Err(error) = run_job_inner(
+    trigger: RunTrigger,
+) -> JobCompletion {
+    match run_job_inner(
         job.clone(),
         log_dir,
         service_log,
@@ -119,16 +152,23 @@ async fn run_job(
         state,
         control_rx,
         emit_stdout,
-        manual,
+        trigger,
     )
     .await
     {
-        write_alert(
-            &alert,
-            &job.name,
-            &format!("job runner internal error: {error:#}"),
-        )
-        .await;
+        Ok(completion) => completion,
+        Err(error) => {
+            write_alert(
+                &alert,
+                &job.name,
+                &format!("job runner internal error: {error:#}"),
+            )
+            .await;
+            JobCompletion {
+                name: job.name,
+                success: false,
+            }
+        }
     }
 }
 
@@ -186,8 +226,8 @@ async fn run_job_inner(
     state: Arc<Mutex<StateSnapshot>>,
     mut control_rx: mpsc::UnboundedReceiver<JobControl>,
     emit_stdout: bool,
-    manual: bool,
-) -> Result<()> {
+    trigger: RunTrigger,
+) -> Result<JobCompletion> {
     let uuid = job
         .uuid
         .expect("job uuid must be assigned before running (see load_and_ensure_ids)");
@@ -198,7 +238,7 @@ async fn run_job_inner(
         started_at.format("%Y%m%d%H%M%S")
     ));
     let history_run_id = match history
-        .record_triggered(&job, started_at, manual, &log_path)
+        .record_triggered(&job, started_at, trigger.kind(), &log_path)
         .await
     {
         Ok(run_id) => Some(run_id),
@@ -263,7 +303,10 @@ async fn run_job_inner(
             )
             .await;
             write_alert(&alert, &job.name, &message).await;
-            return Ok(());
+            return Ok(JobCompletion {
+                name: job.name,
+                success: false,
+            });
         }
     };
 
@@ -294,7 +337,7 @@ async fn run_job_inner(
             pid.map(|pid| pid.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
             log_path.display(),
-            if manual { " manual=true" } else { "" }
+            trigger.log_suffix()
         ),
         emit_stdout,
     )
@@ -339,7 +382,7 @@ async fn run_job_inner(
                                 job.name,
                                 pid,
                                 signal.name(),
-                                if manual { " manual=true" } else { "" }
+                                trigger.log_suffix()
                             ),
                             emit_stdout,
                         )
@@ -428,7 +471,7 @@ async fn run_job_inner(
             terminated_by
                 .map(|signal| format!(" terminated=true signal={}", signal.name()))
                 .unwrap_or_default(),
-            if manual { " manual=true" } else { "" }
+            trigger.log_suffix()
         ),
         emit_stdout,
     )
@@ -438,7 +481,10 @@ async fn run_job_inner(
         write_alert(&alert, &job.name, &error).await;
     }
 
-    Ok(())
+    Ok(JobCompletion {
+        name: job.name,
+        success,
+    })
 }
 
 #[cfg(unix)]
@@ -484,7 +530,7 @@ async fn copy_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AlertConfig, Schedule};
+    use crate::config::{AlertConfig, JobTrigger};
 
     #[tokio::test]
     async fn run_job_inner_sends_exactly_one_alert_when_running_past_threshold() {
@@ -500,15 +546,7 @@ mod tests {
             uuid: Some(Uuid::new_v4()),
             name: "slow".to_string(),
             command: "sleep 1".to_string(),
-            schedule: Schedule {
-                manual_only: true,
-                seconds: vec!["0".to_string()],
-                minutes: vec!["*".to_string()],
-                hours: vec!["*".to_string()],
-                days_of_week: vec!["*".to_string()],
-                days_of_month: vec!["*".to_string()],
-                months: vec!["*".to_string()],
-            },
+            trigger: JobTrigger::Manual,
             // Fires the overrun check almost immediately, well before the
             // 1-second job finishes, so this test stays fast.
             alert_if_running_for_longer_than: Some("0s".to_string()),
@@ -529,7 +567,7 @@ mod tests {
             state,
             control_rx,
             false,
-            false,
+            RunTrigger::Manual,
         )
         .await
         .unwrap();
@@ -561,15 +599,7 @@ mod tests {
             name: "env".to_string(),
             command: "SUNDIALD_TEST_VALUE=expanded; printf '%s\\n' \"$SUNDIALD_TEST_VALUE\""
                 .to_string(),
-            schedule: Schedule {
-                manual_only: true,
-                seconds: vec!["0".to_string()],
-                minutes: vec!["*".to_string()],
-                hours: vec!["*".to_string()],
-                days_of_week: vec!["*".to_string()],
-                days_of_month: vec!["*".to_string()],
-                months: vec!["*".to_string()],
-            },
+            trigger: JobTrigger::Manual,
             alert_if_running_for_longer_than: None,
             group: None,
             source_path: None,
@@ -590,7 +620,7 @@ mod tests {
             Arc::clone(&state),
             control_rx,
             false,
-            false,
+            RunTrigger::Manual,
         )
         .await
         .unwrap();

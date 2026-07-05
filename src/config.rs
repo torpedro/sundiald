@@ -10,7 +10,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use uuid::Uuid;
 
 pub use schedule::Schedule;
@@ -91,7 +91,7 @@ pub struct JobConfig {
     pub uuid: Option<Uuid>,
     pub name: String,
     pub command: String,
-    pub schedule: Schedule,
+    pub trigger: JobTrigger,
     /// If a run is still active this long after it started, sundiald fires a
     /// "still running" alert (once per run) through the normal alert
     /// channels. A duration like `"45s"`, `"10m"`, `"2h"`, `"1d"`, or a
@@ -105,6 +105,96 @@ pub struct JobConfig {
     /// the right source file without re-serializing unrelated config.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum JobTrigger {
+    Schedule(Schedule),
+    After(String),
+    Manual,
+}
+
+impl JobTrigger {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Schedule(_) => "schedule",
+            Self::After(_) => "dependency",
+            Self::Manual => "manual",
+        }
+    }
+
+    pub fn after(&self) -> Option<&str> {
+        match self {
+            Self::After(job) => Some(job),
+            _ => None,
+        }
+    }
+
+    pub fn schedule(&self) -> Option<&Schedule> {
+        match self {
+            Self::Schedule(schedule) => Some(schedule),
+            _ => None,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for JobTrigger {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(value) if value == "manual" => Ok(Self::Manual),
+            serde_yaml::Value::Mapping(mapping) => {
+                let mut schedule = None;
+                let mut after = None;
+                for (key, value) in mapping {
+                    let Some(key) = key.as_str() else {
+                        return Err(D::Error::custom("trigger keys must be strings"));
+                    };
+                    match key {
+                        "schedule" => {
+                            if schedule.is_some() {
+                                return Err(D::Error::custom("trigger.schedule is duplicated"));
+                            }
+                            schedule = Some(
+                                serde_yaml::from_value(value)
+                                    .map_err(|error| D::Error::custom(error.to_string()))?,
+                            );
+                        }
+                        "after" => {
+                            if after.is_some() {
+                                return Err(D::Error::custom("trigger.after is duplicated"));
+                            }
+                            after = Some(
+                                serde_yaml::from_value(value)
+                                    .map_err(|error| D::Error::custom(error.to_string()))?,
+                            );
+                        }
+                        other => {
+                            return Err(D::Error::custom(format!("unknown trigger key '{other}'")));
+                        }
+                    }
+                }
+                match (schedule, after) {
+                    (Some(schedule), None) => Ok(Self::Schedule(schedule)),
+                    (None, Some(after)) => Ok(Self::After(after)),
+                    (None, None) => Err(D::Error::custom(
+                        "trigger must contain exactly one of schedule or after, or be 'manual'",
+                    )),
+                    (Some(_), Some(_)) => Err(D::Error::custom(
+                        "trigger must contain exactly one of schedule or after",
+                    )),
+                }
+            }
+            _ => Err(D::Error::custom(
+                "trigger must be 'manual' or a map containing schedule or after",
+            )),
+        }
+    }
 }
 
 impl JobConfig {
@@ -208,9 +298,23 @@ impl SundialdConfig {
                     format!("invalid alert_if_running_for_longer_than ({job_context})")
                 })?;
             }
-            job.schedule
-                .validate()
-                .with_context(|| format!("invalid schedule ({job_context})"))?;
+            if let JobTrigger::Schedule(schedule) = &job.trigger {
+                schedule
+                    .validate()
+                    .with_context(|| format!("invalid schedule ({job_context})"))?;
+            }
+        }
+
+        for job in &self.jobs {
+            let job_context = job_context(job);
+            if let JobTrigger::After(upstream) = &job.trigger {
+                if upstream.trim().is_empty() {
+                    bail!("trigger.after cannot be empty ({job_context})");
+                }
+                if !names.contains(upstream) {
+                    bail!("unknown trigger.after job '{upstream}' ({job_context})");
+                }
+            }
         }
         Ok(())
     }
@@ -381,30 +485,19 @@ jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541
     command: "echo sundiald is alive"
-    schedule:
-      seconds: ["0"]
-      minutes: ["*/1"]
-      hours: ["*"]
-      days_of_week: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-      days_of_month: ["*"]
-      months: ["*"]
+    trigger:
+      schedule: "0 */1 * * * mon-sun"
   - name: long-lived
     uuid: 87b8069d-2fd9-487e-852a-066314cb1f77
     command: "echo sleeping; sleep 30; echo awake"
     # Fire an alert if this job is still running after 20 seconds.
     alert_if_running_for_longer_than: "20s"
-    schedule:
-      seconds: ["30"]
-      minutes: ["*/5"]
-      hours: ["*"]
-      days_of_week: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-      days_of_month: ["*"]
-      months: ["*"]
+    trigger:
+      schedule: "30 */5 * * * mon-sun"
   - name: fails
     uuid: 14036dee-250c-4625-a3d6-21a068f82a4a
     command: "echo this job fails; exit 42"
-    schedule:
-      manual_only: true
+    trigger: manual
 "#
 }
 
@@ -425,10 +518,8 @@ alert:
 jobs:
   - name: failing-job
     command: "false"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .unwrap();
@@ -464,10 +555,8 @@ jobs:
   - name: slow
     command: "true"
     alert_if_running_for_longer_than: "not-a-duration"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .unwrap();
@@ -483,10 +572,8 @@ jobs:
   - name: slow
     command: "true"
     alert_if_running_for_longer_than: "10m"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .unwrap();
@@ -499,6 +586,76 @@ jobs:
     }
 
     #[test]
+    fn config_accepts_completion_trigger_for_known_upstream() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+jobs:
+  - name: build
+    command: "true"
+    trigger: manual
+  - name: deploy
+    command: "true"
+    trigger:
+      after: build
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_rejects_completion_trigger_for_unknown_upstream() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+jobs:
+  - name: deploy
+    command: "true"
+    trigger:
+      after: build
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_legacy_schedule_field() {
+        let config = serde_yaml::from_str::<SundialdConfig>(
+            r#"
+jobs:
+  - name: old
+    command: "true"
+    schedule:
+      seconds: ["0"]
+      minutes: ["0"]
+      hours: ["*"]
+"#,
+        );
+
+        assert!(config.is_err());
+    }
+
+    #[test]
+    fn config_rejects_legacy_expanded_trigger_schedule() {
+        let config = serde_yaml::from_str::<SundialdConfig>(
+            r#"
+jobs:
+  - name: old
+    command: "true"
+    trigger:
+      schedule:
+        seconds: ["0"]
+        minutes: ["0"]
+        hours: ["*"]
+"#,
+        );
+
+        assert!(config.is_err());
+    }
+
+    #[test]
     fn config_loads_named_external_job_files_relative_to_config() {
         let temp = tempfile::tempdir().unwrap();
         let jobs_dir = temp.path().join("jobs");
@@ -508,10 +665,8 @@ jobs:
             r#"
 - name: cleanup
   command: "true"
-  schedule:
-    seconds: ["0"]
-    minutes: ["0"]
-    hours: ["*"]
+  trigger:
+    schedule: "0 0 * * * *"
 "#,
         )
         .unwrap();
@@ -547,10 +702,8 @@ job_files:
 - name: rotate-logs
   # keep this comment next to the job definition
   command: "true"
-  schedule:
-    seconds: ["0"]
-    minutes: ["0"]
-    hours: ["*"]
+  trigger:
+    schedule: "0 0 * * * *"
 "#,
         )
         .unwrap();

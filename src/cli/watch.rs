@@ -127,8 +127,16 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
 }
 
 fn render_schedule(job: &service::JobStatusResponse) -> String {
-    if job.manual_only {
-        return format!("schedule: {} is manual only", job.name);
+    if job.trigger.kind == "manual" {
+        return format!("trigger: {} is manual", job.name);
+    }
+    if job.trigger.kind == "dependency" {
+        return job
+            .trigger
+            .after
+            .as_deref()
+            .map(|upstream| format!("trigger: {} runs after {upstream}", job.name))
+            .unwrap_or_else(|| format!("trigger: {} runs after an unknown job", job.name));
     }
     if job.next_runs.is_empty() {
         return format!("schedule: no upcoming runs found for {}", job.name);
@@ -355,7 +363,10 @@ mod tests {
             terminated_by_signal: None,
             next_run: None,
             next_runs: Vec::new(),
-            manual_only: false,
+            trigger: service::TriggerStatusResponse {
+                kind: "schedule".to_string(),
+                after: None,
+            },
             manual_pending: false,
         }
     }
@@ -376,10 +387,10 @@ mod tests {
     }
 
     #[test]
-    fn render_schedule_reports_manual_only_jobs() {
+    fn render_schedule_reports_manual_trigger_jobs() {
         let mut job = job_response();
-        job.manual_only = true;
+        job.trigger.kind = "manual".to_string();
 
-        assert_eq!(render_schedule(&job), "schedule: example is manual only");
+        assert_eq!(render_schedule(&job), "trigger: example is manual");
     }
 }

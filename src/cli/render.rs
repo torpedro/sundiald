@@ -114,6 +114,11 @@ fn colored_status(job: &service::JobStatusResponse) -> String {
         status
     };
 
+    let status = match job.trigger.after.as_deref() {
+        Some(upstream) => format!("{status} trigger={} after={upstream}", job.trigger.kind),
+        None => format!("{status} trigger={}", job.trigger.kind),
+    };
+
     let status = if matches!(job.status, state::JobStatus::Running) {
         match job.pid {
             Some(pid) => format!("{status} pid={pid}"),
@@ -162,8 +167,17 @@ fn format_last_run(job: &service::JobStatusResponse, now: DateTime<Local>) -> St
 }
 
 fn format_next_run(job: &service::JobStatusResponse, now: DateTime<Local>) -> String {
-    if job.manual_only {
-        return "manual only".yellow().to_string();
+    match job.trigger.kind.as_str() {
+        "manual" => return "manual".yellow().to_string(),
+        "dependency" => {
+            return job
+                .trigger
+                .after
+                .as_deref()
+                .map(|upstream| format!("after {upstream}").cyan().to_string())
+                .unwrap_or_else(|| "after unknown".to_string());
+        }
+        _ => {}
     }
 
     job.next_run
@@ -256,7 +270,10 @@ mod tests {
             terminated_by_signal: None,
             next_run: None,
             next_runs: Vec::new(),
-            manual_only: false,
+            trigger: service::TriggerStatusResponse {
+                kind: "schedule".to_string(),
+                after: None,
+            },
             manual_pending: false,
         }
     }
@@ -332,12 +349,12 @@ mod tests {
     }
 
     #[test]
-    fn format_next_run_reports_manual_only_jobs_distinctly() {
+    fn format_next_run_reports_manual_trigger_jobs_distinctly() {
         let now = Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
         let mut job = job_response(state::JobStatus::Idle);
-        job.manual_only = true;
+        job.trigger.kind = "manual".to_string();
 
-        assert!(format_next_run(&job, now).contains("manual only"));
+        assert!(format_next_run(&job, now).contains("manual"));
     }
 
     #[test]

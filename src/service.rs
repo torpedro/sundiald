@@ -22,15 +22,20 @@ use tokio::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+pub use api::TriggerStatusResponse;
 pub use api::{HistoryResponse, JobStatusResponse, LogResponse, StatusResponse};
 
 use api::ApiState;
 use cleanup::cleanup_old_files;
 use history::HistoryDb;
 use orphan::alert_orphaned_process_groups;
-use process::{JobControl, RunningJob, SignalKind, spawn_tracked_job};
+use process::{JobCompletion, JobControl, RunTrigger, RunningJob, SignalKind, spawn_tracked_job};
 
-use crate::{config::SundialdConfig, state::StateSnapshot};
+use crate::{
+    config::{JobTrigger, SundialdConfig},
+    state::StateSnapshot,
+};
 
 fn current_second(now: DateTime<Local>) -> DateTime<Local> {
     now.with_nanosecond(0).unwrap_or(now)
@@ -113,6 +118,7 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
     let pending_manual = Arc::new(Mutex::new(HashSet::new()));
     let running_controls = Arc::new(Mutex::new(HashMap::new()));
     let (manual_tx, mut manual_rx) = mpsc::unbounded_channel();
+    let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
     let api_state = ApiState {
         config: Arc::clone(&config),
         config_path,
@@ -141,7 +147,14 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
             Some(job_name) = manual_rx.recv() => {
                 retain_running(&mut running);
                 let current_config = config.read().await.clone();
-                handle_manual_request(&current_config, &mut running, history.clone(), Arc::clone(&state), Arc::clone(&pending_manual), Arc::clone(&running_controls), job_name).await?;
+                handle_manual_request(&current_config, &mut running, history.clone(), Arc::clone(&state), Arc::clone(&pending_manual), Arc::clone(&running_controls), completion_tx.clone(), job_name).await?;
+            }
+            Some(completion) = completion_rx.recv() => {
+                retain_running(&mut running);
+                if completion.success {
+                    let current_config = config.read().await.clone();
+                    handle_job_completion(&current_config, &mut running, history.clone(), Arc::clone(&state), Arc::clone(&running_controls), completion_tx.clone(), completion).await;
+                }
             }
             _ = tick.tick() => {
                 retain_running(&mut running);
@@ -154,11 +167,16 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
                     if running.contains_key(&uuid) {
                         continue;
                     }
-                    if !job.schedule.matches(second) {
-                        continue;
-                    }
-                    if !fired_seconds.insert((uuid, second)) {
-                        continue;
+                    match &job.trigger {
+                        JobTrigger::Schedule(schedule) => {
+                            if !schedule.matches(second) {
+                                continue;
+                            }
+                            if !fired_seconds.insert((uuid, second)) {
+                                continue;
+                            }
+                        }
+                        JobTrigger::After(_) | JobTrigger::Manual => continue,
                     }
 
                     let running_job = spawn_tracked_job(
@@ -170,8 +188,9 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
                         history.clone(),
                         Arc::clone(&state),
                         Arc::clone(&running_controls),
+                        completion_tx.clone(),
                         true,
-                        false,
+                        RunTrigger::Schedule,
                     );
                     running.insert(uuid, running_job);
                 }
@@ -220,6 +239,7 @@ async fn handle_manual_request(
     state: Arc<Mutex<StateSnapshot>>,
     pending_manual: Arc<Mutex<HashSet<String>>>,
     running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
+    completion_tx: mpsc::UnboundedSender<JobCompletion>,
     job_name: String,
 ) -> Result<()> {
     let Some(job) = config.jobs.iter().find(|job| job.name == job_name).cloned() else {
@@ -276,8 +296,9 @@ async fn handle_manual_request(
         history,
         state,
         running_controls,
+        completion_tx,
         true,
-        true,
+        RunTrigger::Manual,
     );
     let pending = Arc::clone(&pending_manual);
     let original_handle = running_job.handle;
@@ -289,6 +310,46 @@ async fn handle_manual_request(
     Ok(())
 }
 
+async fn handle_job_completion(
+    config: &SundialdConfig,
+    running: &mut HashMap<Uuid, RunningJob>,
+    history: HistoryDb,
+    state: Arc<Mutex<StateSnapshot>>,
+    running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
+    completion_tx: mpsc::UnboundedSender<JobCompletion>,
+    completion: JobCompletion,
+) {
+    for job in config.jobs.iter().filter(|job| {
+        matches!(
+            &job.trigger,
+            JobTrigger::After(upstream) if upstream == &completion.name
+        )
+    }) {
+        let Some(uuid) = job.uuid else {
+            continue;
+        };
+        if running.contains_key(&uuid) {
+            continue;
+        }
+        let running_job = spawn_tracked_job(
+            job.clone(),
+            config.log_dir.clone(),
+            config.service_log.clone(),
+            config.alert.clone(),
+            config.state_dir.clone(),
+            history.clone(),
+            Arc::clone(&state),
+            Arc::clone(&running_controls),
+            completion_tx.clone(),
+            true,
+            RunTrigger::Dependency {
+                upstream: completion.name.clone(),
+            },
+        );
+        running.insert(uuid, running_job);
+    }
+}
+
 fn retain_running(running: &mut HashMap<Uuid, RunningJob>) {
     running.retain(|_, running_job| !running_job.handle.is_finished());
 }
@@ -298,5 +359,67 @@ fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
         path.to_path_buf()
     } else {
         base.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AlertConfig, JobConfig};
+
+    fn manual_job(name: &str) -> JobConfig {
+        JobConfig {
+            uuid: Some(Uuid::new_v4()),
+            name: name.to_string(),
+            command: "true".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            source_path: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_completion_triggers_downstream_job() {
+        let temp = tempfile::tempdir().unwrap();
+        let log_dir = temp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let upstream = manual_job("build");
+        let mut downstream = manual_job("deploy");
+        downstream.trigger = JobTrigger::After("build".to_string());
+        let config = SundialdConfig {
+            state_dir: temp.path().to_path_buf(),
+            log_dir,
+            service_log: temp.path().join("sundiald.log"),
+            api_bind: "127.0.0.1:0".parse().unwrap(),
+            log_retention_days: 14,
+            alert: AlertConfig::default(),
+            job_files: Vec::new(),
+            jobs: vec![upstream.clone(), downstream.clone()],
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(job_identities(&config))));
+        let running_controls = Arc::new(Mutex::new(HashMap::new()));
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let mut running = HashMap::new();
+
+        handle_job_completion(
+            &config,
+            &mut running,
+            history,
+            Arc::clone(&state),
+            running_controls,
+            completion_tx,
+            JobCompletion {
+                name: upstream.name,
+                success: true,
+            },
+        )
+        .await;
+
+        assert!(running.contains_key(&downstream.uuid.unwrap()));
+        let completion = completion_rx.recv().await.unwrap();
+        assert_eq!(completion.name, "deploy");
+        assert!(completion.success);
     }
 }

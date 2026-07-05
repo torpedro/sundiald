@@ -1,30 +1,50 @@
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, Timelike};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Schedule {
-    #[serde(default)]
-    pub manual_only: bool,
-    #[serde(default)]
     pub seconds: Vec<String>,
-    #[serde(default)]
     pub minutes: Vec<String>,
-    #[serde(default)]
     pub hours: Vec<String>,
-    #[serde(default = "star")]
     pub days_of_week: Vec<String>,
-    #[serde(default = "star")]
     pub days_of_month: Vec<String>,
-    #[serde(default = "star")]
     pub months: Vec<String>,
 }
 
+impl<'de> Deserialize<'de> for Schedule {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        let expression = String::deserialize(deserializer)?;
+        Self::from_cron(&expression).map_err(D::Error::custom)
+    }
+}
+
 impl Schedule {
-    pub fn validate(&self) -> Result<()> {
-        if self.manual_only {
-            return Ok(());
+    fn from_cron(expression: &str) -> Result<Self> {
+        let fields = expression.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 6 {
+            bail!(
+                "schedule must have 6 cron fields: second minute hour day-of-month month day-of-week"
+            );
         }
+        let schedule = Self {
+            seconds: vec![fields[0].to_string()],
+            minutes: vec![fields[1].to_string()],
+            hours: vec![fields[2].to_string()],
+            days_of_month: vec![fields[3].to_string()],
+            months: vec![fields[4].to_string()],
+            days_of_week: vec![fields[5].to_string()],
+        };
+        schedule.validate()?;
+        Ok(schedule)
+    }
+
+    pub fn validate(&self) -> Result<()> {
         require_field(&self.seconds, "seconds")?;
         require_field(&self.minutes, "minutes")?;
         require_field(&self.hours, "hours")?;
@@ -38,10 +58,6 @@ impl Schedule {
     }
 
     pub fn matches(&self, time: DateTime<Local>) -> bool {
-        if self.manual_only {
-            return false;
-        }
-
         let compiled = CompiledSchedule::compile(self);
         let second = time.second();
         let minute = time.minute();
@@ -62,7 +78,7 @@ impl Schedule {
     /// so a schedule that can never fire (e.g. day 31 restricted to February)
     /// returns quickly instead of scanning ~150 million seconds.
     pub fn next_runs(&self, after: DateTime<Local>, count: usize) -> Vec<DateTime<Local>> {
-        if self.manual_only || count == 0 {
+        if count == 0 {
             return Vec::new();
         }
 
@@ -283,10 +299,6 @@ fn month_aliases() -> [(&'static str, u32); 12] {
     ]
 }
 
-fn star() -> Vec<String> {
-    vec!["*".to_string()]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,7 +307,6 @@ mod tests {
     #[test]
     fn schedule_matches_aliases_ranges_and_steps() {
         let schedule = Schedule {
-            manual_only: false,
             seconds: vec!["0,30".to_string()],
             minutes: vec!["*/15".to_string()],
             hours: vec!["9-17".to_string()],
@@ -315,7 +326,6 @@ mod tests {
     #[test]
     fn schedule_rejects_out_of_range_values() {
         let schedule = Schedule {
-            manual_only: false,
             seconds: vec!["*".to_string()],
             minutes: vec!["60".to_string()],
             hours: vec!["*".to_string()],
@@ -330,7 +340,6 @@ mod tests {
     #[test]
     fn schedule_rejects_out_of_range_seconds() {
         let schedule = Schedule {
-            manual_only: false,
             seconds: vec!["60".to_string()],
             minutes: vec!["*".to_string()],
             hours: vec!["*".to_string()],
@@ -343,37 +352,33 @@ mod tests {
     }
 
     #[test]
-    fn schedule_requires_seconds_minutes_and_hours_for_non_manual_jobs() {
-        let config: crate::config::SundialdConfig = serde_yaml::from_str(
+    fn schedule_requires_six_cron_fields() {
+        let config = serde_yaml::from_str::<crate::config::SundialdConfig>(
             r#"
 jobs:
   - name: every-minute
     command: "true"
-    schedule:
-      minutes: ["*"]
+    trigger:
+      schedule: "* * *"
 "#,
-        )
-        .unwrap();
-        let schedule = &config.jobs[0].schedule;
+        );
 
-        assert!(schedule.validate().is_err());
+        assert!(config.is_err());
     }
 
     #[test]
-    fn schedule_keeps_day_and_month_defaults() {
+    fn schedule_accepts_six_field_cron_expression() {
         let config: crate::config::SundialdConfig = serde_yaml::from_str(
             r#"
 jobs:
   - name: every-minute
     command: "true"
-    schedule:
-      seconds: ["0"]
-      minutes: ["*"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 * * * * *"
 "#,
         )
         .unwrap();
-        let schedule = &config.jobs[0].schedule;
+        let schedule = config.jobs[0].trigger.schedule().unwrap();
 
         assert!(schedule.validate().is_ok());
         assert!(schedule.matches(Local.with_ymd_and_hms(2026, 7, 3, 9, 30, 0).unwrap()));
@@ -383,7 +388,6 @@ jobs:
     #[test]
     fn next_runs_handles_seconds() {
         let schedule = Schedule {
-            manual_only: false,
             seconds: vec!["*/15".to_string()],
             minutes: vec!["*".to_string()],
             hours: vec!["*".to_string()],
@@ -409,7 +413,6 @@ jobs:
         // brute-forcing seconds for years (regression test for the old
         // second-by-second scan over ~150 million iterations).
         let schedule = Schedule {
-            manual_only: false,
             seconds: vec!["0".to_string()],
             minutes: vec!["0".to_string()],
             hours: vec!["0".to_string()],
@@ -427,7 +430,6 @@ jobs:
         // Standard cron semantics: when both fields are restricted, a day
         // matches if *either* is satisfied (union), not both (intersection).
         let schedule = Schedule {
-            manual_only: false,
             seconds: vec!["0".to_string()],
             minutes: vec!["0".to_string()],
             hours: vec!["0".to_string()],
@@ -447,23 +449,5 @@ jobs:
         // 2026-07-07 is neither the 1st nor a Monday.
         let neither = Local.with_ymd_and_hms(2026, 7, 7, 0, 0, 0).unwrap();
         assert!(!schedule.matches(neither));
-    }
-
-    #[test]
-    fn manual_only_schedule_never_matches_or_has_next_runs() {
-        let schedule = Schedule {
-            manual_only: true,
-            seconds: vec!["*".to_string()],
-            minutes: vec!["*".to_string()],
-            hours: vec!["*".to_string()],
-            days_of_week: vec!["*".to_string()],
-            days_of_month: vec!["*".to_string()],
-            months: vec!["*".to_string()],
-        };
-        let now = Local.with_ymd_and_hms(2026, 7, 4, 13, 36, 44).unwrap();
-
-        assert!(schedule.validate().is_ok());
-        assert!(!schedule.matches(now));
-        assert!(schedule.next_runs(now, 1).is_empty());
     }
 }

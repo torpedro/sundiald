@@ -26,7 +26,7 @@ use uuid::Uuid;
 use super::history::{HistoryDb, RunHistoryEntry};
 use super::process::{JobControl, SignalKind};
 use crate::{
-    config::SundialdConfig,
+    config::{JobTrigger, SundialdConfig},
     state::{JobStatus, StateSnapshot},
 };
 
@@ -63,8 +63,14 @@ pub struct JobStatusResponse {
     pub terminated_by_signal: Option<String>,
     pub next_run: Option<DateTime<Local>>,
     pub next_runs: Vec<DateTime<Local>>,
-    pub manual_only: bool,
+    pub trigger: TriggerStatusResponse,
     pub manual_pending: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TriggerStatusResponse {
+    pub kind: String,
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -511,7 +517,11 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                 .uuid
                 .expect("job uuid must be assigned before serving status");
             let state = by_id.get(&uuid);
-            let next_runs = job.schedule.next_runs(now, 10);
+            let next_runs = job
+                .trigger
+                .schedule()
+                .map(|schedule| schedule.next_runs(now, 10))
+                .unwrap_or_default();
             JobStatusResponse {
                 uuid,
                 name: job.name.clone(),
@@ -530,7 +540,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                 terminated_by_signal: state.and_then(|state| state.terminated_by_signal.clone()),
                 next_run: next_runs.first().copied(),
                 next_runs,
-                manual_only: job.schedule.manual_only,
+                trigger: trigger_response(&job.trigger),
                 manual_pending: pending.contains(&job.name),
             }
         })
@@ -565,7 +575,10 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
             terminated_by_signal: state.terminated_by_signal.clone(),
             next_run: None,
             next_runs: Vec::new(),
-            manual_only: true,
+            trigger: TriggerStatusResponse {
+                kind: "manual".to_string(),
+                after: None,
+            },
             manual_pending: false,
         });
     }
@@ -573,6 +586,13 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
     StatusResponse {
         updated_at: Local::now(),
         jobs,
+    }
+}
+
+fn trigger_response(trigger: &JobTrigger) -> TriggerStatusResponse {
+    TriggerStatusResponse {
+        kind: trigger.kind().to_string(),
+        after: trigger.after().map(str::to_string),
     }
 }
 
@@ -603,7 +623,7 @@ fn tail_lines(content: &str, max_lines: usize) -> Option<String> {
 mod tests {
     use super::*;
     use crate::{
-        config::{AlertConfig, JobConfig, Schedule},
+        config::{AlertConfig, JobConfig, JobTrigger, Schedule},
         service::history::HistoryDb,
         state::JobState,
     };
@@ -621,15 +641,14 @@ mod tests {
                 uuid: Some(Uuid::new_v4()),
                 name: "sleepy".to_string(),
                 command: "sleep 3".to_string(),
-                schedule: Schedule {
-                    manual_only: false,
+                trigger: JobTrigger::Schedule(Schedule {
                     seconds: vec!["0".to_string()],
                     minutes: vec!["*".to_string()],
                     hours: vec!["*".to_string()],
                     days_of_week: vec!["*".to_string()],
                     days_of_month: vec!["*".to_string()],
                     months: vec!["*".to_string()],
-                },
+                }),
                 alert_if_running_for_longer_than: None,
                 group: None,
                 source_path: None,
@@ -809,7 +828,7 @@ mod tests {
         let history = HistoryDb::open(temp.path()).await.unwrap();
         let started_at = Local::now();
         let run_id = history
-            .record_triggered(&job, started_at, true, &temp.path().join("sleepy.log"))
+            .record_triggered(&job, started_at, "manual", &temp.path().join("sleepy.log"))
             .await
             .unwrap();
         history
@@ -1025,10 +1044,8 @@ mod tests {
 jobs:
   - name: original
     command: "true"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .await
@@ -1054,16 +1071,12 @@ jobs:
 jobs:
   - name: reloaded
     command: "true"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
   - name: second
     command: "true"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .await
@@ -1098,10 +1111,8 @@ jobs:
 jobs:
   - name: original
     command: "true"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .await
@@ -1126,16 +1137,12 @@ jobs:
 jobs:
   - name: original
     command: "true"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
   - name: original
     command: "true"
-    schedule:
-      seconds: ["0"]
-      minutes: ["0"]
-      hours: ["*"]
+    trigger:
+      schedule: "0 0 * * * *"
 "#,
         )
         .await

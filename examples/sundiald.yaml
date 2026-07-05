@@ -29,27 +29,16 @@ jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541
     command: "echo sundiald is alive"
-    schedule:
-      seconds: ["0"]
-      minutes: ["*/1"]
-      hours: ["*"]
-      days_of_week: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-      days_of_month: ["*"]
-      months: ["*"]
+    trigger:
+      schedule: "0 */1 * * * mon-sun"
   - name: long-lived
     uuid: 87b8069d-2fd9-487e-852a-066314cb1f77
     command: "echo sleeping; sleep 30; echo awake"
     # Fire an alert if this job is still running after 20 seconds.
     alert_if_running_for_longer_than: "20s"
-    schedule:
-      seconds: ["30"]
-      minutes: ["*/5"]
-      hours: ["*"]
-      days_of_week: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-      days_of_month: ["*"]
-      months: ["*"]
+    trigger:
+      schedule: "30 */5 * * * mon-sun"
   - name: fails
     uuid: 14036dee-250c-4625-a3d6-21a068f82a4a
     command: "echo this job fails; exit 42"
-    schedule:
-      manual_only: true
+    trigger: manual

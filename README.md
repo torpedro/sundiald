@@ -49,37 +49,28 @@ jobs:
   - name: heartbeat
     uuid: a63d6b30-d69d-4e08-946e-1ad554d0d541
     command: "echo sundiald is alive"
-    schedule:
-      seconds: ["0"]
-      minutes: ["*/1"]
-      hours: ["*"]
-      days_of_week: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-      days_of_month: ["*"]
-      months: ["*"]
+    trigger:
+      schedule: "0 */1 * * * mon-sun"
   - name: long-lived
     uuid: 87b8069d-2fd9-487e-852a-066314cb1f77
     command: "echo sleeping; sleep 30; echo awake"
     # Fire an alert if this job is still running after 20 seconds.
     alert_if_running_for_longer_than: "20s"
-    schedule:
-      seconds: ["30"]
-      minutes: ["*/5"]
-      hours: ["*"]
-      days_of_week: ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
-      days_of_month: ["*"]
-      months: ["*"]
+    trigger:
+      schedule: "30 */5 * * * mon-sun"
   - name: fails
     uuid: 14036dee-250c-4625-a3d6-21a068f82a4a
     command: "echo this job fails; exit 42"
-    schedule:
-      manual_only: true
+    trigger: manual
 ```
 
-Schedule fields accept `*`, exact numbers, ranges like `1-5`, steps like `*/15`, and comma-separated values like `1,15,30`. For non-manual jobs, `seconds`, `minutes`, and `hours` are required. Seconds and minutes use `0` through `59`; hours use `0` through `23`. Weekdays accept `mon` through `sun`; months accept `jan` through `dec` or `1` through `12`. Day and month fields default to `["*"]` when omitted. Set `manual_only: true` in a schedule to disable scheduled runs while keeping manual runs available.
+Each job has one `trigger`: `schedule`, `after`, or `manual`. Scheduled jobs run by time. Dependency jobs use `trigger.after: <job-name>` and run when that upstream job finishes successfully, including when the upstream was started manually. Manual jobs never run automatically but remain runnable through the CLI/API/UI.
+
+Schedules use a six-field cron expression under `trigger.schedule`: `second minute hour day-of-month month day-of-week`. Fields accept `*`, exact numbers, ranges like `1-5`, steps like `*/15`, and comma-separated values like `1,15,30`. Seconds and minutes use `0` through `59`; hours use `0` through `23`. Weekdays accept `mon` through `sun`; months accept `jan` through `dec` or `1` through `12`.
 
 Job `command` strings are executed through `sh -c`, so standard shell environment expansion works there, e.g. `$HOME`, `${HOME}`, and variables assigned earlier in the command string. Config path fields are resolved as paths and are not shell-expanded.
 
-If both `days_of_week` and `days_of_month` are restricted (not left as `*`), a day matches when *either* is satisfied, matching standard cron semantics — e.g. `days_of_month: ["1"]` plus `days_of_week: ["mon"]` runs on the 1st of the month *or* on Mondays, not only on a Monday that happens to be the 1st. If only one of the two is restricted, only that one applies.
+If both day-of-week and day-of-month are restricted (not left as `*`), a day matches when *either* is satisfied, matching standard cron semantics — e.g. `0 0 9 1 * mon` runs at 09:00:00 on the 1st of the month *or* on Mondays, not only on a Monday that happens to be the 1st. If only one of the two is restricted, only that one applies.
 
 Failures are appended to `alert.log` and also written as JSON files under `alert.event_dir`. If `alert.command` is present, sundiald runs that configured program with configured args. If `alert.pushover` is present, sundiald sends the alert to Pushover using the configured application token and user/group key. Sundiald does not pass alert data through environment variables. A failure to deliver to `alert.command` or Pushover is logged to stderr but does not itself generate another alert.
 
@@ -104,14 +95,15 @@ Each referenced file is a YAML list of job definitions:
 ```yaml
 - name: rotate-logs
   command: "/usr/local/bin/rotate-app-logs"
-  schedule:
-    seconds: ["0"]
-    minutes: ["0"]
-    hours: ["3"]
+  trigger:
+    schedule: "0 0 3 * * *"
 - name: rebuild-report
   command: "/usr/local/bin/rebuild-report"
-  schedule:
-    manual_only: true
+  trigger: manual
+- name: publish-report
+  command: "/usr/local/bin/publish-report"
+  trigger:
+    after: rebuild-report
 ```
 
 Relative `job_files.path` values are resolved relative to the main config file. Jobs loaded from a job file keep the file's `name` as their `group` in the HTTP status response, so callers can present them grouped by source later. Missing job UUIDs are written back to the file that defined the job, not necessarily the main config.
@@ -126,7 +118,7 @@ When `--config` is not supplied, sundiald reads `~/.config/sundiald/config.yaml`
 
 Job state (status, last run, exit code) persists in `state_dir/state.json` and is reloaded on startup, so `status` reflects history across restarts. A job that was `running` when the service last stopped is marked `interrupted`, since its process died with the previous instance and its actual outcome is unknown. On Unix, if sundiald sees that the previous run's process group is still present during startup, it writes an alert for the orphaned process group but does not kill it automatically.
 
-Run history is recorded in a SQLite database at `state_dir/history.sqlite3`. Each run inserts a row when the job is triggered, including the trigger time and whether it was `automatic` or `manual`; when the run finishes, that row is updated with finish time, duration in milliseconds, and exit code. A job that fails to start still gets a history row with a finish time and duration, but no exit code.
+Run history is recorded in a SQLite database at `state_dir/history.sqlite3`. Each run inserts a row when the job is triggered, including the trigger time and whether it was `schedule`, `dependency`, or `manual`; when the run finishes, that row is updated with finish time, duration in milliseconds, and exit code. A job that fails to start still gets a history row with a finish time and duration, but no exit code.
 
 ```sh
 cargo run -- reload
@@ -237,6 +229,6 @@ curl -X POST http://127.0.0.1:8787/reload
 
 The CLI uses this API for `ui`, `history`, `run`/`terminate`/`kill`, and `reload`, so the same surface can back a web UI later. Job route parameters accept either job names or UUIDs.
 
-`/status` reports a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted` (was `running` when the service last restarted) per job, plus a `terminated_by_signal` field (`"SIGTERM"`/`"SIGKILL"`/`null`) when a run ended because it was signaled via `terminate`/`kill` rather than exiting on its own, a `uuid` field with the job's stable identity, a `group` field for jobs loaded from a named job file, and `next_runs` with up to 10 upcoming scheduled run times.
+`/status` reports a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted` (was `running` when the service last restarted) per job, plus a `terminated_by_signal` field (`"SIGTERM"`/`"SIGKILL"`/`null`) when a run ended because it was signaled via `terminate`/`kill` rather than exiting on its own, a `uuid` field with the job's stable identity, a `group` field for jobs loaded from a named job file, a `trigger` object, and `next_runs` with up to 10 upcoming run times for scheduled jobs.
 
 `/jobs/{job}/history?limit=50` returns recent SQLite run-history rows including trigger kind, start/finish times, duration, exit code, final status, error text, signal, group, and log path. `/jobs/{job}/logs/latest?tail=40` returns the recent stdout/stderr log content for the latest known run.

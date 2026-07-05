@@ -61,6 +61,17 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Show recent run history for a job.
+    History {
+        /// Job name or UUID to inspect.
+        job: String,
+        /// YAML config file to load.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+        /// Maximum number of runs to show.
+        #[arg(short, long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Open the interactive status UI.
     Ui {
         /// YAML config file to inspect.
@@ -168,6 +179,11 @@ async fn main() -> Result<()> {
             let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             cli::reload_config(&config).await
+        }
+        Command::History { job, config, limit } => {
+            let config = resolve_config_path(config);
+            let config = SundialdConfig::load(&config)?;
+            cli::print_history(&config, &job, limit).await
         }
         Command::Ui { config, once } => {
             let config = resolve_config_path(config);

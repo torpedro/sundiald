@@ -153,12 +153,23 @@ async fn record_history_finished(
     started_at: chrono::DateTime<Local>,
     finished_at: chrono::DateTime<Local>,
     exit_code: Option<i32>,
+    status: &str,
+    terminated_by_signal: Option<&str>,
+    error: Option<&str>,
 ) {
     let Some(run_id) = run_id else {
         return;
     };
     if let Err(error) = history
-        .record_finished(run_id, started_at, finished_at, exit_code)
+        .record_finished(
+            run_id,
+            started_at,
+            finished_at,
+            exit_code,
+            status,
+            terminated_by_signal,
+            error,
+        )
         .await
     {
         eprintln!("failed to record run finish for job '{job_name}': {error:#}");
@@ -181,7 +192,15 @@ async fn run_job_inner(
         .uuid
         .expect("job uuid must be assigned before running (see load_and_ensure_ids)");
     let started_at = Local::now();
-    let history_run_id = match history.record_triggered(&job, started_at, manual).await {
+    let log_path = log_dir.join(format!(
+        "{}-{}.log",
+        super::sanitize_name(&job.name),
+        started_at.format("%Y%m%d%H%M%S")
+    ));
+    let history_run_id = match history
+        .record_triggered(&job, started_at, manual, &log_path)
+        .await
+    {
         Ok(run_id) => Some(run_id),
         Err(error) => {
             eprintln!(
@@ -191,11 +210,6 @@ async fn run_job_inner(
             None
         }
     };
-    let log_path = log_dir.join(format!(
-        "{}-{}.log",
-        super::sanitize_name(&job.name),
-        started_at.format("%Y%m%d%H%M%S")
-    ));
 
     let mut command = Command::new("sh");
     command
@@ -243,6 +257,9 @@ async fn run_job_inner(
                 started_at,
                 finished_at,
                 None,
+                "start_failed",
+                None,
+                Some(&message),
             )
             .await;
             write_alert(&alert, &job.name, &message).await;
@@ -358,10 +375,12 @@ async fn run_job_inner(
     } else {
         JobStatus::Failed
     };
+    let history_status = status_kind.to_string();
+    let history_signal = terminated_by.map(|signal| signal.name());
     let last_error = if success {
         None
-    } else if let Some(signal) = terminated_by {
-        Some(format!("terminated by {}", signal.name()))
+    } else if let Some(signal) = history_signal {
+        Some(format!("terminated by {signal}"))
     } else {
         Some(format!("non-zero exit status {:?}", exit_code))
     };
@@ -390,6 +409,9 @@ async fn run_job_inner(
         started_at,
         finished_at,
         exit_code,
+        &history_status,
+        history_signal,
+        last_error.as_deref(),
     )
     .await;
     super::log_service_event(

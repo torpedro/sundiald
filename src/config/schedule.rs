@@ -28,12 +28,12 @@ impl Schedule {
         require_field(&self.seconds, "seconds")?;
         require_field(&self.minutes, "minutes")?;
         require_field(&self.hours, "hours")?;
-        parse_field(&self.seconds, 0, 59, &[])?;
-        parse_field(&self.minutes, 0, 59, &[])?;
-        parse_field(&self.hours, 0, 23, &[])?;
-        parse_field(&self.days_of_week, 1, 7, &weekday_aliases())?;
-        parse_field(&self.days_of_month, 1, 31, &[])?;
-        parse_field(&self.months, 1, 12, &month_aliases())?;
+        parse_field("seconds", &self.seconds, 0, 59, &[])?;
+        parse_field("minutes", &self.minutes, 0, 59, &[])?;
+        parse_field("hours", &self.hours, 0, 23, &[])?;
+        parse_field("days_of_week", &self.days_of_week, 1, 7, &weekday_aliases())?;
+        parse_field("days_of_month", &self.days_of_month, 1, 31, &[])?;
+        parse_field("months", &self.months, 1, 12, &month_aliases())?;
         Ok(())
     }
 
@@ -186,10 +186,17 @@ fn compile_field(values: &[String], min: u32, max: u32, aliases: &[(&str, u32)])
     set.into_iter().collect()
 }
 
-fn parse_field(values: &[String], min: u32, max: u32, aliases: &[(&str, u32)]) -> Result<()> {
+fn parse_field(
+    name: &str,
+    values: &[String],
+    min: u32,
+    max: u32,
+    aliases: &[(&str, u32)],
+) -> Result<()> {
     for value in values {
         for part in value.split(',') {
-            expand_part(part.trim(), min, max, aliases)?;
+            expand_part(part.trim(), min, max, aliases)
+                .with_context(|| format!("invalid schedule.{name} value '{part}'"))?;
         }
     }
     Ok(())
@@ -197,7 +204,7 @@ fn parse_field(values: &[String], min: u32, max: u32, aliases: &[(&str, u32)]) -
 
 fn require_field(values: &[String], name: &str) -> Result<()> {
     if values.is_empty() {
-        bail!("schedule field '{name}' is required for non-manual jobs");
+        bail!("schedule.{name} is required for non-manual jobs");
     }
     Ok(())
 }

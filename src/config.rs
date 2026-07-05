@@ -188,31 +188,29 @@ impl SundialdConfig {
         let mut names = HashSet::new();
         let mut uuids = HashSet::new();
         for job in &self.jobs {
+            let job_context = job_context(job);
             if job.name.trim().is_empty() {
-                bail!("job name cannot be empty");
+                bail!("job name cannot be empty ({job_context})");
             }
             if !names.insert(job.name.clone()) {
-                bail!("duplicate job name '{}'", job.name);
+                bail!("duplicate job name '{}' ({job_context})", job.name);
             }
             if let Some(uuid) = job.uuid {
                 if !uuids.insert(uuid) {
-                    bail!("duplicate job uuid '{uuid}' (job '{}')", job.name);
+                    bail!("duplicate job uuid '{uuid}' ({job_context})");
                 }
             }
             if job.command.trim().is_empty() {
-                bail!("job '{}' command cannot be empty", job.name);
+                bail!("command cannot be empty ({job_context})");
             }
             if let Some(duration) = &job.alert_if_running_for_longer_than {
                 duration::parse_duration(duration).with_context(|| {
-                    format!(
-                        "invalid alert_if_running_for_longer_than for job '{}'",
-                        job.name
-                    )
+                    format!("invalid alert_if_running_for_longer_than ({job_context})")
                 })?;
             }
             job.schedule
                 .validate()
-                .with_context(|| format!("invalid schedule for job '{}'", job.name))?;
+                .with_context(|| format!("invalid schedule ({job_context})"))?;
         }
         Ok(())
     }
@@ -292,6 +290,17 @@ fn resolve_path(base: &Path, path: &Path) -> PathBuf {
     } else {
         base.join(path)
     }
+}
+
+fn job_context(job: &JobConfig) -> String {
+    let mut context = format!("job '{}'", job.name);
+    if let Some(group) = &job.group {
+        context.push_str(&format!(", group '{group}'"));
+    }
+    if let Some(source_path) = &job.source_path {
+        context.push_str(&format!(", file {}", source_path.display()));
+    }
+    context
 }
 
 fn default_state_dir() -> PathBuf {

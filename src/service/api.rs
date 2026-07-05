@@ -8,7 +8,7 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -23,6 +23,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use super::history::{HistoryDb, RunHistoryEntry};
 use super::process::{JobControl, SignalKind};
 use crate::{
     config::SundialdConfig,
@@ -38,6 +39,7 @@ pub(crate) struct ApiState {
     pub(crate) pending_manual: Arc<Mutex<HashSet<String>>>,
     pub(crate) manual_tx: mpsc::UnboundedSender<String>,
     pub(crate) running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
+    pub(crate) history: HistoryDb,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -84,6 +86,27 @@ pub struct ReloadResponse {
     pub jobs: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub job: String,
+    pub uuid: Uuid,
+    pub runs: Vec<RunHistoryEntry>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogResponse {
+    pub job: String,
+    pub uuid: Uuid,
+    pub log_path: PathBuf,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+    tail: Option<usize>,
+}
+
 pub(crate) async fn run_api(bind: SocketAddr, state: ApiState) -> Result<()> {
     let listener = TcpListener::bind(bind)
         .await
@@ -98,6 +121,8 @@ async fn run_api_on_listener(listener: TcpListener, state: ApiState) -> Result<(
         .route("/jobs/{job}/run", post(api_run_job))
         .route("/jobs/{job}/terminate", post(api_terminate_job))
         .route("/jobs/{job}/kill", post(api_kill_job))
+        .route("/jobs/{job}/history", get(api_job_history))
+        .route("/jobs/{job}/logs/latest", get(api_latest_log))
         .route("/reload", post(api_reload))
         .with_state(state);
     axum::serve(listener, app)
@@ -195,6 +220,103 @@ async fn api_kill_job(State(api): State<ApiState>, AxumPath(job): AxumPath<Strin
     api_signal_job(api, job, SignalKind::Kill).await
 }
 
+async fn api_job_history(
+    State(api): State<ApiState>,
+    AxumPath(job): AxumPath<String>,
+    Query(query): Query<LimitQuery>,
+) -> Response {
+    let Some(uuid) = resolve_job_id(&api, &job).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown job '{job}'") })),
+        )
+            .into_response();
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    match api.history.runs_for_job(uuid, limit).await {
+        Ok(runs) => (
+            StatusCode::OK,
+            Json(HistoryResponse {
+                job: resolve_job_label(&api, uuid).await,
+                uuid,
+                runs,
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{error:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_latest_log(
+    State(api): State<ApiState>,
+    AxumPath(job): AxumPath<String>,
+    Query(query): Query<LimitQuery>,
+) -> Response {
+    let Some(uuid) = resolve_job_id(&api, &job).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown job '{job}'") })),
+        )
+            .into_response();
+    };
+
+    let state_log_path = api
+        .state
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .find(|state| state.uuid == uuid)
+        .and_then(|state| state.log_path.clone());
+    let log_path = match state_log_path {
+        Some(path) => Some(path),
+        None => match api.history.latest_log_path_for_job(uuid).await {
+            Ok(path) => path,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("{error:#}") })),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let Some(log_path) = log_path else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("job '{job}' has no log file") })),
+        )
+            .into_response();
+    };
+    let runtime_base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let log_path = absolutize_path(&runtime_base, &log_path);
+    match fs::read_to_string(&log_path).await {
+        Ok(content) => {
+            let tail = query.tail.unwrap_or(40).clamp(1, 2_000);
+            (
+                StatusCode::OK,
+                Json(LogResponse {
+                    job: resolve_job_label(&api, uuid).await,
+                    uuid,
+                    log_path,
+                    content: tail_lines(&content, tail)
+                        .unwrap_or_else(|| "(empty log)".to_string()),
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to read {}: {error}", log_path.display()) })),
+        )
+            .into_response(),
+    }
+}
+
 /// Resolves a `job` name from a URL path to the uuid it's actually tracked
 /// under. Prefers the current config (covers both the ordinary case and a
 /// rename: same uuid, the name in the request is whatever the job is called
@@ -205,6 +327,29 @@ async fn api_kill_job(State(api): State<ApiState>, AxumPath(job): AxumPath<Strin
 /// otherwise become permanently unreachable the instant its name drops out
 /// of the config.
 async fn resolve_job_id(api: &ApiState, job_name: &str) -> Option<Uuid> {
+    if let Ok(uuid) = Uuid::parse_str(job_name) {
+        let config_has_id = api
+            .config
+            .read()
+            .await
+            .jobs
+            .iter()
+            .any(|candidate| candidate.uuid == Some(uuid));
+        if config_has_id {
+            return Some(uuid);
+        }
+        let state_has_running_id = api
+            .state
+            .lock()
+            .await
+            .jobs
+            .iter()
+            .any(|state| state.uuid == uuid && state.status.is_running());
+        if state_has_running_id {
+            return Some(uuid);
+        }
+    }
+
     let id_from_config = api
         .config
         .read()
@@ -224,6 +369,29 @@ async fn resolve_job_id(api: &ApiState, job_name: &str) -> Option<Uuid> {
         .iter()
         .find(|state| state.name == job_name && state.status.is_running())
         .map(|state| state.uuid)
+}
+
+async fn resolve_job_label(api: &ApiState, uuid: Uuid) -> String {
+    if let Some(name) = api
+        .config
+        .read()
+        .await
+        .jobs
+        .iter()
+        .find(|job| job.uuid == Some(uuid))
+        .map(|job| job.name.clone())
+    {
+        return name;
+    }
+
+    api.state
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .find(|state| state.uuid == uuid)
+        .map(|state| state.name.clone())
+        .unwrap_or_else(|| uuid.to_string())
 }
 
 async fn api_signal_job(api: ApiState, job: String, signal: SignalKind) -> Response {
@@ -412,11 +580,27 @@ fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
     }
 }
 
+fn tail_lines(content: &str, max_lines: usize) -> Option<String> {
+    let lines = content.lines().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let start = lines.len().saturating_sub(max_lines);
+    let mut output = String::new();
+    if start > 0 {
+        output.push_str(&format!("... {} earlier line(s) omitted\n", start));
+    }
+    output.push_str(&lines[start..].join("\n"));
+    Some(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         config::{AlertConfig, JobConfig, Schedule},
+        service::history::HistoryDb,
         state::JobState,
     };
 
@@ -451,6 +635,7 @@ mod tests {
 
     fn test_api(config: SundialdConfig, snapshot: StateSnapshot) -> ApiState {
         let (manual_tx, _manual_rx) = mpsc::unbounded_channel();
+        let history = HistoryDb::test_at(config.state_dir.join("history.sqlite3"));
         ApiState {
             config: Arc::new(RwLock::new(config)),
             config_path: PathBuf::from("sundiald.yaml"),
@@ -458,6 +643,7 @@ mod tests {
             pending_manual: Arc::new(Mutex::new(HashSet::new())),
             manual_tx,
             running_controls: Arc::new(Mutex::new(HashMap::new())),
+            history,
         }
     }
 
@@ -466,6 +652,7 @@ mod tests {
         snapshot: StateSnapshot,
         manual_tx: mpsc::UnboundedSender<String>,
     ) -> ApiState {
+        let history = HistoryDb::test_at(config.state_dir.join("history.sqlite3"));
         ApiState {
             config: Arc::new(RwLock::new(config)),
             config_path: PathBuf::from("sundiald.yaml"),
@@ -473,6 +660,7 @@ mod tests {
             pending_manual: Arc::new(Mutex::new(HashSet::new())),
             manual_tx,
             running_controls: Arc::new(Mutex::new(HashMap::new())),
+            history,
         }
     }
 
@@ -582,6 +770,92 @@ mod tests {
         let log_path = status.jobs[0].log_path.as_ref().unwrap();
         assert!(log_path.is_absolute());
         assert!(log_path.ends_with(".sundiald/logs/sleepy.log"));
+    }
+
+    #[tokio::test]
+    async fn api_exposes_job_history_endpoint_by_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path().to_path_buf());
+        let job = config.jobs[0].clone();
+        let job_id = job.uuid.unwrap();
+        let snapshot = StateSnapshot::new(vec![(job_id, "sleepy".to_string())]);
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let started_at = Local::now();
+        let run_id = history
+            .record_triggered(&job, started_at, true, &temp.path().join("sleepy.log"))
+            .await
+            .unwrap();
+        history
+            .record_finished(
+                run_id,
+                started_at,
+                started_at + chrono::Duration::milliseconds(15),
+                Some(0),
+                "succeeded",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut api = test_api(config, snapshot);
+        api.history = history;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_api_on_listener(listener, api));
+
+        let history: HistoryResponse = reqwest::Client::new()
+            .get(format!("http://{addr}/jobs/{job_id}/history?limit=5"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(history.uuid, job_id);
+        assert_eq!(history.runs.len(), 1);
+        assert_eq!(history.runs[0].status.as_deref(), Some("succeeded"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn api_exposes_latest_log_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = test_config(temp.path().to_path_buf());
+        let job_id = config.jobs[0].uuid.unwrap();
+        let log_path = temp.path().join("logs").join("sleepy.log");
+        tokio::fs::create_dir_all(log_path.parent().unwrap())
+            .await
+            .unwrap();
+        tokio::fs::write(&log_path, "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        let mut snapshot = StateSnapshot::new(vec![(job_id, "sleepy".to_string())]);
+        let mut state = running_job_state(job_id, "sleepy");
+        state.log_path = Some(log_path.clone());
+        snapshot.upsert(state);
+        let api = test_api(config, snapshot);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_api_on_listener(listener, api));
+
+        let log: LogResponse = reqwest::Client::new()
+            .get(format!("http://{addr}/jobs/{job_id}/logs/latest?tail=2"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(log.uuid, job_id);
+        assert!(log.log_path.is_absolute());
+        assert_eq!(log.content, "... 1 earlier line(s) omitted\ntwo\nthree");
+        handle.abort();
     }
 
     #[tokio::test]

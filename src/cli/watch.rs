@@ -6,7 +6,6 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use tokio::{
-    fs,
     sync::mpsc,
     time::{self, Duration},
 };
@@ -61,10 +60,10 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                     KeyCode::Char('r') => {
                         if let Some(job) = jobs.get(selected) {
                             let job_name = job.name.clone();
-                            let encoded_job_name = encode_path_segment(&job_name);
+                            let encoded_job_id = encode_path_segment(&job.uuid.to_string());
                             last_command = post_watch_action(
                                 &config,
-                                &format!("/jobs/{encoded_job_name}/run"),
+                                &format!("/jobs/{encoded_job_id}/run"),
                                 &format!("queued manual run for {job_name}"),
                             )
                             .await;
@@ -73,10 +72,10 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                     KeyCode::Char('T') => {
                         if let Some(job) = jobs.get(selected) {
                             let job_name = job.name.clone();
-                            let encoded_job_name = encode_path_segment(&job_name);
+                            let encoded_job_id = encode_path_segment(&job.uuid.to_string());
                             last_command = post_watch_action(
                                 &config,
-                                &format!("/jobs/{encoded_job_name}/terminate"),
+                                &format!("/jobs/{encoded_job_id}/terminate"),
                                 &format!("sent SIGTERM to {job_name}"),
                             )
                             .await;
@@ -85,10 +84,10 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                     KeyCode::Char('K') => {
                         if let Some(job) = jobs.get(selected) {
                             let job_name = job.name.clone();
-                            let encoded_job_name = encode_path_segment(&job_name);
+                            let encoded_job_id = encode_path_segment(&job.uuid.to_string());
                             last_command = post_watch_action(
                                 &config,
-                                &format!("/jobs/{encoded_job_name}/kill"),
+                                &format!("/jobs/{encoded_job_id}/kill"),
                                 &format!("sent SIGKILL to {job_name}"),
                             )
                             .await;
@@ -103,9 +102,14 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                             last_command = render_schedule(job);
                         }
                     }
+                    KeyCode::Char('h') => {
+                        if let Some(job) = jobs.get(selected) {
+                            last_command = read_history(&config, job).await;
+                        }
+                    }
                     KeyCode::Enter => {
                         if let Some(job) = jobs.get(selected) {
-                            last_command = read_recent_log(job).await;
+                            last_command = read_recent_log(&config, job).await;
                         }
                     }
                     _ => {}
@@ -142,34 +146,100 @@ fn render_schedule(job: &service::JobStatusResponse) -> String {
     output
 }
 
-async fn read_recent_log(job: &service::JobStatusResponse) -> String {
-    let Some(log_path) = &job.log_path else {
-        return format!("log: no log file for {}", job.name);
-    };
-
-    match fs::read_to_string(log_path).await {
-        Ok(content) => format!(
-            "log: {}\n---- stdout/stderr ----\n{}",
-            log_path.display(),
-            tail_lines(&content, 40).unwrap_or_else(|| "(empty log)".to_string())
-        ),
-        Err(error) => format!("log: failed to read {}: {error}", log_path.display()),
+async fn read_recent_log(config: &SundialdConfig, job: &service::JobStatusResponse) -> String {
+    let encoded_job_id = encode_path_segment(&job.uuid.to_string());
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/jobs/{encoded_job_id}/logs/latest?tail=40",
+            api_base(config)
+        ))
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<service::LogResponse>().await {
+                Ok(log) => format!(
+                    "log: {}\n---- stdout/stderr ----\n{}",
+                    log.log_path.display(),
+                    log.content
+                ),
+                Err(error) => format!("log: failed to parse api response: {error}"),
+            }
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            format!("log: rejected: HTTP {status}: {body}")
+        }
+        Err(error) => format!("log: failed to reach api: {error}"),
     }
 }
 
-fn tail_lines(content: &str, max_lines: usize) -> Option<String> {
-    let lines = content.lines().collect::<Vec<_>>();
-    if lines.is_empty() {
-        return None;
+async fn read_history(config: &SundialdConfig, job: &service::JobStatusResponse) -> String {
+    let encoded_job_id = encode_path_segment(&job.uuid.to_string());
+    let response = reqwest::Client::new()
+        .get(format!(
+            "{}/jobs/{encoded_job_id}/history?limit=10",
+            api_base(config)
+        ))
+        .send()
+        .await;
+    match response {
+        Ok(response) if response.status().is_success() => {
+            match response.json::<service::HistoryResponse>().await {
+                Ok(history) => render_history(&history),
+                Err(error) => format!("history: failed to parse api response: {error}"),
+            }
+        }
+        Ok(response) => {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            format!("history: rejected: HTTP {status}: {body}")
+        }
+        Err(error) => format!("history: failed to reach api: {error}"),
+    }
+}
+
+fn render_history(history: &service::HistoryResponse) -> String {
+    if history.runs.is_empty() {
+        return format!("history: no runs recorded for {}", history.job);
     }
 
-    let start = lines.len().saturating_sub(max_lines);
-    let mut output = String::new();
-    if start > 0 {
-        output.push_str(&format!("... {} earlier line(s) omitted\n", start));
+    let mut output = format!(
+        "history: last {} run(s) for {}",
+        history.runs.len(),
+        history.job
+    );
+    for run in &history.runs {
+        let status = run.status.as_deref().unwrap_or("running");
+        let exit = run
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let duration = run
+            .duration_ms
+            .map(format_duration_ms)
+            .unwrap_or_else(|| "-".to_string());
+        output.push_str(&format!(
+            "\n{:>4}. {} {} status={} exit={} duration={}",
+            run.id,
+            run.triggered_at.format("%Y-%m-%d %H:%M:%S %:z"),
+            run.trigger_kind,
+            status,
+            exit,
+            duration
+        ));
+        if let Some(error) = &run.error {
+            output.push_str(&format!(" error={error}"));
+        }
     }
-    output.push_str(&lines[start..].join("\n"));
-    Some(output)
+    output
+}
+
+fn format_duration_ms(duration_ms: i64) -> String {
+    let seconds = duration_ms / 1_000;
+    let milliseconds = duration_ms % 1_000;
+    format!("{seconds}.{milliseconds:03}s")
 }
 
 /// Fire-and-report POST used by watch mode's key handlers: unlike the
@@ -285,20 +355,6 @@ mod tests {
             manual_only: false,
             manual_pending: false,
         }
-    }
-
-    #[test]
-    fn tail_lines_limits_output_and_reports_omitted_lines() {
-        let content = "one\ntwo\nthree\nfour";
-
-        let tail = tail_lines(content, 2).unwrap();
-
-        assert_eq!(tail, "... 2 earlier line(s) omitted\nthree\nfour");
-    }
-
-    #[test]
-    fn tail_lines_reports_empty_logs() {
-        assert!(tail_lines("", 40).is_none());
     }
 
     #[test]

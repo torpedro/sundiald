@@ -20,34 +20,38 @@ pub(crate) async fn render_status(
     let status = fetch_status(config).await?;
 
     let mut output = String::new();
-    for (index, job) in status.jobs.iter().enumerate() {
-        if index > 0 {
+    let groups = group_jobs(&status.jobs);
+    for (group_index, (group, jobs)) in groups.iter().enumerate() {
+        if group_index > 0 {
             output.push_str("----\n");
         }
+        output.push_str(&format!("{}\n", group_label(group).bold()));
 
-        let is_selected = selected == Some(index);
-        let marker = if is_selected {
-            "> "
-        } else if selected.is_some() {
-            "  "
-        } else {
-            ""
-        };
-        let name = if is_selected {
-            job.name.bold().to_string()
-        } else {
-            job.name.clone()
-        };
+        for &(index, job) in jobs {
+            let is_selected = selected == Some(index);
+            let marker = if is_selected {
+                "> "
+            } else if selected.is_some() {
+                "  "
+            } else {
+                ""
+            };
+            let name = if is_selected {
+                job.name.bold().to_string()
+            } else {
+                job.name.clone()
+            };
 
-        output.push_str(&format!("{marker}{name}\n"));
-        output.push_str(&format!("  status: {}\n", colored_status(job)));
-        output.push_str(&format!("  last_run: {}\n", format_last_run(job, now)));
-        output.push_str(&format!("  next_run: {}\n", format_next_run(job, now)));
+            output.push_str(&format!("{marker}{name}\n"));
+            output.push_str(&format!("  status: {}\n", colored_status(job)));
+            output.push_str(&format!("  last_run: {}\n", format_last_run(job, now)));
+            output.push_str(&format!("  next_run: {}\n", format_next_run(job, now)));
+        }
     }
     if let Some(last_command) = last_command {
         output.push('\n');
         output.push_str(
-            "keys: arrows/j/k select, Enter log, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, q quit",
+            "keys: arrows/j/k select, Enter log, h history, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, q quit",
         );
         output.push('\n');
         output.push_str(last_command);
@@ -55,6 +59,25 @@ pub(crate) async fn render_status(
     }
 
     Ok((output, status.jobs))
+}
+
+fn group_jobs(
+    jobs: &[service::JobStatusResponse],
+) -> Vec<(Option<String>, Vec<(usize, &service::JobStatusResponse)>)> {
+    let mut groups: Vec<(Option<String>, Vec<(usize, &service::JobStatusResponse)>)> = Vec::new();
+    for (index, job) in jobs.iter().enumerate() {
+        let group = job.group.clone();
+        if let Some((_, entries)) = groups.iter_mut().find(|(existing, _)| *existing == group) {
+            entries.push((index, job));
+        } else {
+            groups.push((group, vec![(index, job)]));
+        }
+    }
+    groups
+}
+
+fn group_label(group: &Option<String>) -> &str {
+    group.as_deref().unwrap_or("inline")
 }
 
 fn high_level_status(job: &service::JobStatusResponse) -> &'static str {

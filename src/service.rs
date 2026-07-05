@@ -22,7 +22,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-pub use api::{JobStatusResponse, StatusResponse};
+pub use api::{HistoryResponse, JobStatusResponse, LogResponse, StatusResponse};
 
 use api::ApiState;
 use cleanup::cleanup_old_files;
@@ -120,6 +120,7 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
         pending_manual: Arc::clone(&pending_manual),
         manual_tx,
         running_controls: Arc::clone(&running_controls),
+        history: history.clone(),
     };
     let api_handle = tokio::spawn(api::run_api(api_bind, api_state));
 

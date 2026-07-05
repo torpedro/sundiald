@@ -34,6 +34,19 @@ pub(crate) async fn post_api(config: &SundialdConfig, path: &str) -> Result<reqw
         })
 }
 
+pub(crate) async fn get_api(config: &SundialdConfig, path: &str) -> Result<reqwest::Response> {
+    reqwest::Client::new()
+        .get(format!("{}{path}", api_base(config)))
+        .send()
+        .await
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "failed to connect to sundiald api at {}: {error:#}",
+                api_base(config)
+            )
+        })
+}
+
 pub(crate) async fn report_response(
     response: reqwest::Response,
     action: &str,

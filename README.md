@@ -208,11 +208,14 @@ cargo run -- config
 cargo run -- run heartbeat
 cargo run -- terminate sleepy
 cargo run -- kill sleepy
+cargo run -- history heartbeat
 cargo run -- ui
 cargo run -- ui --once
 ```
 
-The `ui` command opens the interactive view by default. Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `s` to show the next 10 scheduled runs, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
+The `ui` command opens the interactive view by default, grouped by each job's configured job-file group (or `inline` for jobs from the main config). Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `h` to show recent run history, `s` to show the next 10 scheduled runs, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, and `q` to quit.
+
+Job-control and history commands accept either a job name or a job UUID. UUIDs are stable across renames and are what the interactive UI uses internally.
 
 Manual runs are requested through the HTTP API and executed by the long-running `daemon` process, so ad-hoc jobs are still child processes of the main sundiald service.
 
@@ -222,12 +225,16 @@ Manual runs are requested through the HTTP API and executed by the long-running 
 
 ```sh
 curl http://127.0.0.1:8787/status
+curl http://127.0.0.1:8787/jobs/heartbeat/history
+curl 'http://127.0.0.1:8787/jobs/heartbeat/logs/latest?tail=40'
 curl -X POST http://127.0.0.1:8787/jobs/heartbeat/run
 curl -X POST http://127.0.0.1:8787/jobs/sleepy/terminate
 curl -X POST http://127.0.0.1:8787/jobs/sleepy/kill
 curl -X POST http://127.0.0.1:8787/reload
 ```
 
-The CLI uses this API for `ui`, `run`/`terminate`/`kill`, and `reload`, so the same surface can back a web UI later.
+The CLI uses this API for `ui`, `history`, `run`/`terminate`/`kill`, and `reload`, so the same surface can back a web UI later. Job route parameters accept either job names or UUIDs.
 
-`/status` reports a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted` (was `running` when the service last restarted) per job, plus a `terminated_by_signal` field (`"SIGTERM"`/`"SIGKILL"`/`null`) when a run ended because it was signaled via `terminate`/`kill` rather than exiting on its own, a `uuid` field with the job's stable identity, and a `group` field for jobs loaded from a named job file.
+`/status` reports a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted` (was `running` when the service last restarted) per job, plus a `terminated_by_signal` field (`"SIGTERM"`/`"SIGKILL"`/`null`) when a run ended because it was signaled via `terminate`/`kill` rather than exiting on its own, a `uuid` field with the job's stable identity, a `group` field for jobs loaded from a named job file, and `next_runs` with up to 10 upcoming scheduled run times.
+
+`/jobs/{job}/history?limit=50` returns recent SQLite run-history rows including trigger kind, start/finish times, duration, exit code, final status, error text, signal, group, and log path. `/jobs/{job}/logs/latest?tail=40` returns the recent stdout/stderr log content for the latest known run.

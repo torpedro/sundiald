@@ -112,7 +112,7 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                             last_command = read_recent_log(&config, job).await;
                         }
                     }
-                    KeyCode::Delete => {
+                    KeyCode::Backspace => {
                         last_command.clear();
                     }
                     _ => {}

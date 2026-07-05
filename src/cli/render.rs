@@ -62,7 +62,7 @@ pub(crate) async fn render_status(
     if let Some(last_command) = last_command {
         output.push('\n');
         output.push_str(
-            "keys: arrows/j/k select, Enter log, h history, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, Del clear, q quit",
+            "keys: arrows/j/k select, Enter log, h history, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, Backspace clear, q quit",
         );
         output.push('\n');
         if !last_command.is_empty() {

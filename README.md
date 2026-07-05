@@ -215,7 +215,7 @@ cargo run -- ui
 cargo run -- ui --once
 ```
 
-The `ui` command opens the interactive view by default, grouping jobs from named job files under their configured group names. Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `h` to show recent run history, `s` to show the next 10 scheduled runs, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, `Del` to clear details, and `q` to quit.
+The `ui` command opens the interactive view by default, grouping jobs from named job files under their configured group names. Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select a job, `Enter` to show the recent log file for the selected job, `h` to show recent run history, `s` to show the next 10 scheduled runs, `r` to run the selected job immediately, `T` to send SIGTERM, `K` to send SIGKILL, `R` to reload config, `Backspace` to clear details, and `q` to quit.
 
 Job-control and history commands accept either a job name or a job UUID. UUIDs are stable across renames and are what the interactive UI uses internally.
 

@@ -442,11 +442,7 @@ async fn read_recent_log(config: &SundialdConfig, job_uuid: uuid::Uuid) -> Strin
     match response {
         Ok(response) if response.status().is_success() => {
             match response.json::<service::LogResponse>().await {
-                Ok(log) => format!(
-                    "log: {}\n---- stdout/stderr ----\n{}",
-                    log.log_path.display(),
-                    log.content
-                ),
+                Ok(log) => render_log_response(&log),
                 Err(error) => format!("log: failed to parse api response: {error}"),
             }
         }
@@ -457,6 +453,22 @@ async fn read_recent_log(config: &SundialdConfig, job_uuid: uuid::Uuid) -> Strin
         }
         Err(error) => format!("log: failed to reach api: {error}"),
     }
+}
+
+fn render_log_response(log: &service::LogResponse) -> String {
+    let mut output = format!(
+        "stdout log: {}\n---- stdout ----\n{}",
+        log.log_path.display(),
+        log.content
+    );
+    if let (Some(path), Some(content)) = (&log.stderr_log_path, &log.stderr_content) {
+        output.push_str(&format!(
+            "\nstderr log: {}\n---- stderr ----\n{}",
+            path.display(),
+            content
+        ));
+    }
+    output
 }
 
 async fn read_history(config: &SundialdConfig, job_uuid: uuid::Uuid) -> String {

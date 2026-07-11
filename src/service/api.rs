@@ -104,7 +104,9 @@ pub struct LogResponse {
     pub job: String,
     pub uuid: Uuid,
     pub log_path: PathBuf,
+    pub stderr_log_path: Option<PathBuf>,
     pub content: String,
+    pub stderr_content: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,17 +303,39 @@ async fn api_latest_log(
     let config = api.config.read().await.clone();
     let runtime_base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let log_path = resolve_log_path(&config.log_dir, &runtime_base, &log_path);
+    let stderr_log_path = stderr_log_path_for_stdout(&log_path);
     match fs::read_to_string(&log_path).await {
         Ok(content) => {
             let tail = query.tail.unwrap_or(40).clamp(1, 2_000);
+            let stderr = match fs::read_to_string(&stderr_log_path).await {
+                Ok(content) => Some((
+                    stderr_log_path,
+                    tail_lines(&content, tail).unwrap_or_else(|| "(empty log)".to_string()),
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!("failed to read {}: {error}", stderr_log_path.display())
+                        })),
+                    )
+                        .into_response();
+                }
+            };
+            let (stderr_log_path, stderr_content) = stderr
+                .map(|(path, content)| (Some(path), Some(content)))
+                .unwrap_or((None, None));
             (
                 StatusCode::OK,
                 Json(LogResponse {
                     job: resolve_job_label(&api, uuid).await,
                     uuid,
                     log_path,
+                    stderr_log_path,
                     content: tail_lines(&content, tail)
                         .unwrap_or_else(|| "(empty log)".to_string()),
+                    stderr_content,
                 }),
             )
                 .into_response()
@@ -615,6 +639,17 @@ fn resolve_log_path(log_dir: &Path, runtime_base: &Path, path: &Path) -> PathBuf
     absolutize_path(runtime_base, path)
 }
 
+fn stderr_log_path_for_stdout(stdout_log_path: &Path) -> PathBuf {
+    let Some(file_name) = stdout_log_path.file_name().and_then(|name| name.to_str()) else {
+        return stdout_log_path.with_extension("stderr.log");
+    };
+    let stderr_file_name = file_name
+        .strip_suffix(".stdout.log")
+        .map(|stem| format!("{stem}.stderr.log"))
+        .unwrap_or_else(|| format!("{file_name}.stderr.log"));
+    stdout_log_path.with_file_name(stderr_file_name)
+}
+
 fn tail_lines(content: &str, max_lines: usize) -> Option<String> {
     let lines = content.lines().collect::<Vec<_>>();
     if lines.is_empty() {
@@ -904,11 +939,19 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = test_config(temp.path().to_path_buf());
         let job_id = config.jobs[0].uuid.unwrap();
-        let log_path = temp.path().join("logs").join("sleepy.log");
+        let log_path = temp
+            .path()
+            .join("logs")
+            .join("sleepy")
+            .join("20260711120000.stdout.log");
+        let stderr_log_path = log_path.with_file_name("20260711120000.stderr.log");
         tokio::fs::create_dir_all(log_path.parent().unwrap())
             .await
             .unwrap();
         tokio::fs::write(&log_path, "one\ntwo\nthree\n")
+            .await
+            .unwrap();
+        tokio::fs::write(&stderr_log_path, "warn\nerror\n")
             .await
             .unwrap();
         let mut snapshot = StateSnapshot::new(vec![(job_id, "sleepy".to_string())]);
@@ -934,6 +977,11 @@ mod tests {
         assert_eq!(log.uuid, job_id);
         assert!(log.log_path.is_absolute());
         assert_eq!(log.content, "... 1 earlier line(s) omitted\ntwo\nthree");
+        assert_eq!(
+            log.stderr_log_path.as_deref(),
+            Some(stderr_log_path.as_path())
+        );
+        assert_eq!(log.stderr_content.as_deref(), Some("warn\nerror"));
         handle.abort();
     }
 

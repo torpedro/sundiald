@@ -79,7 +79,7 @@ Failures are appended to `alert.log` and also written as JSON files under `alert
 
 Set a job's optional `alert_if_running_for_longer_than` (e.g. `"45s"`, `"10m"`, `"2h"`, `"1d"`, or a compound value like `"1h30m"`) to fire the same alert channels once if a run is still active past that threshold — useful for catching a job that's hung or unexpectedly slow. It fires at most once per run (not repeated for the rest of that run) and doesn't affect the job itself; it keeps running either way.
 
-By default, runtime state, history, and logs are written under `$HOME/.local/state/sundiald`; `sample-config` prints this as an absolute path for the current user. Job log files under `log_dir` and alert event JSON files under `alert.event_dir` are pruned automatically based on `log_retention_days` and `alert.retention_days` (checked once at startup and then hourly). Set either to `0` to keep files forever.
+By default, runtime state, history, and logs are written under `$HOME/.local/state/sundiald`; `sample-config` prints this as an absolute path for the current user. Each job gets a directory under `log_dir` named after the sanitized job name. Each run writes stdout to `<timestamp>.stdout.log`; stderr is written to a sibling `<timestamp>.stderr.log` only if the job actually writes stderr. Job log files under `log_dir` and alert event JSON files under `alert.event_dir` are pruned automatically based on `log_retention_days` and `alert.retention_days` (checked once at startup and then hourly). Set either to `0` to keep files forever.
 
 Each job has a stable `uuid` used internally to track it across renames — `name` is just a label. You don't need to set `uuid` by hand: `daemon` (and `reload`) generate one for any job missing it and write it back into the YAML file in place, next to that job's `name`, without disturbing comments or formatting elsewhere in the file. As long as you keep the `uuid` line when you rename a job, the service recognizes it as the same job across the rename — its live/last run status carries over under the new name instead of resetting. Removing a job from the config entirely (not renaming it) while it's still running leaves it visible in `status` and controllable by its last-known name until it finishes, since there's no new name to carry it forward to.
 
@@ -198,7 +198,7 @@ sundiald reload --config /etc/sundiald/sundiald.yaml
 sundiald run heartbeat --config /etc/sundiald/sundiald.yaml
 ```
 
-View service logs with `journalctl -u sundiald -f`. Per-job stdout/stderr logs are written under the configured `log_dir`, and alert events are written under `alert.event_dir`.
+View service logs with `journalctl -u sundiald -f`. Per-job stdout and stderr logs are written under per-job directories in the configured `log_dir`, and alert events are written under `alert.event_dir`.
 
 ## Inspect
 

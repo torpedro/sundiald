@@ -232,13 +232,12 @@ async fn run_job_inner(
         .uuid
         .expect("job uuid must be assigned before running (see load_and_ensure_ids)");
     let started_at = Local::now();
-    let log_path = log_dir.join(format!(
-        "{}-{}.log",
-        super::sanitize_name(&job.name),
-        started_at.format("%Y%m%d%H%M%S")
-    ));
+    let job_log_dir = log_dir.join(super::sanitize_name(&job.name));
+    let log_stem = started_at.format("%Y%m%d%H%M%S").to_string();
+    let stdout_log_path = job_log_dir.join(format!("{log_stem}.stdout.log"));
+    let stderr_log_path = job_log_dir.join(format!("{log_stem}.stderr.log"));
     let history_run_id = match history
-        .record_triggered(&job, started_at, trigger.kind(), &log_path)
+        .record_triggered(&job, started_at, trigger.kind(), &stdout_log_path)
         .await
     {
         Ok(run_id) => Some(run_id),
@@ -285,7 +284,7 @@ async fn run_job_inner(
                     started_at: Some(started_at),
                     finished_at: Some(finished_at),
                     exit_code: None,
-                    log_path: Some(log_path),
+                    log_path: Some(stdout_log_path),
                     last_error: Some(message.clone()),
                     terminated_by_signal: None,
                 },
@@ -323,7 +322,7 @@ async fn run_job_inner(
             started_at: Some(started_at),
             finished_at: None,
             exit_code: None,
-            log_path: Some(log_path.clone()),
+            log_path: Some(stdout_log_path.clone()),
             last_error: None,
             terminated_by_signal: None,
         },
@@ -332,12 +331,13 @@ async fn run_job_inner(
     super::log_service_event(
         &service_log,
         format!(
-            "{} job_started job={} pid={} log_path={}{}",
+            "{} job_started job={} pid={} stdout_log_path={} stderr_log_path={}{}",
             started_at.to_rfc3339(),
             job.name,
             pid.map(|pid| pid.to_string())
                 .unwrap_or_else(|| "unknown".to_string()),
-            log_path.display(),
+            stdout_log_path.display(),
+            stderr_log_path.display(),
             trigger.log_suffix()
         ),
         emit_stdout,
@@ -352,10 +352,8 @@ async fn run_job_inner(
         .stderr
         .take()
         .context("child stderr was not captured")?;
-    let stdout_log_path = log_path.clone();
-    let stderr_log_path = log_path.clone();
-    let stdout_task = tokio::spawn(copy_stream("stdout", stdout, stdout_log_path));
-    let stderr_task = tokio::spawn(copy_stream("stderr", stderr, stderr_log_path));
+    let stdout_task = tokio::spawn(copy_stream(stdout, stdout_log_path.clone()));
+    let stderr_task = tokio::spawn(copy_stream_lazy(stderr, stderr_log_path.clone()));
 
     let alert_threshold = job.alert_threshold();
     let mut overrun_alerted = false;
@@ -440,7 +438,7 @@ async fn run_job_inner(
             started_at: Some(started_at),
             finished_at: Some(finished_at),
             exit_code,
-            log_path: Some(log_path.clone()),
+            log_path: Some(stdout_log_path.clone()),
             last_error: last_error.clone(),
             terminated_by_signal: terminated_by.map(|signal| signal.name().to_string()),
         },
@@ -461,14 +459,15 @@ async fn run_job_inner(
     super::log_service_event(
         &service_log,
         format!(
-            "{} job_finished job={} exit_code={} success={} log_path={}{}{}",
+            "{} job_finished job={} exit_code={} success={} stdout_log_path={} stderr_log_path={}{}{}",
             finished_at.to_rfc3339(),
             job.name,
             exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "signal".to_string()),
             success,
-            log_path.display(),
+            stdout_log_path.display(),
+            stderr_log_path.display(),
             terminated_by
                 .map(|signal| format!(" terminated=true signal={}", signal.name()))
                 .unwrap_or_default(),
@@ -507,12 +506,11 @@ fn send_signal(_pid: u32, signal: SignalKind) -> Result<()> {
     anyhow::bail!("{} is not supported on this platform", signal.name())
 }
 
-async fn copy_stream(
-    label: &'static str,
-    stream: impl tokio::io::AsyncRead + Unpin,
-    log_path: PathBuf,
-) -> Result<()> {
+async fn copy_stream(stream: impl tokio::io::AsyncRead + Unpin, log_path: PathBuf) -> Result<()> {
     let mut reader = BufReader::new(stream).lines();
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -521,8 +519,33 @@ async fn copy_stream(
         .with_context(|| format!("failed to open log {}", log_path.display()))?;
 
     while let Some(line) = reader.next_line().await? {
-        file.write_all(format!("[{}] {line}\n", label).as_bytes())
-            .await?;
+        file.write_all(format!("{line}\n").as_bytes()).await?;
+    }
+
+    Ok(())
+}
+
+async fn copy_stream_lazy(
+    stream: impl tokio::io::AsyncRead + Unpin,
+    log_path: PathBuf,
+) -> Result<()> {
+    let mut reader = BufReader::new(stream).lines();
+    let Some(first_line) = reader.next_line().await? else {
+        return Ok(());
+    };
+    if let Some(parent) = log_path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .await
+        .with_context(|| format!("failed to open log {}", log_path.display()))?;
+    file.write_all(format!("{first_line}\n").as_bytes()).await?;
+
+    while let Some(line) = reader.next_line().await? {
+        file.write_all(format!("{line}\n").as_bytes()).await?;
     }
 
     Ok(())
@@ -615,7 +638,7 @@ mod tests {
 
         run_job_inner(
             job,
-            log_dir,
+            log_dir.clone(),
             temp.path().join("sundiald.log"),
             alert,
             temp.path().to_path_buf(),
@@ -636,8 +659,17 @@ mod tests {
             .and_then(|job| job.log_path.as_ref())
             .expect("completed job should have a log path");
         let log = tokio::fs::read_to_string(log_path).await.unwrap();
+        let stderr_path = log_path.with_file_name(
+            log_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace(".stdout.log", ".stderr.log"),
+        );
 
-        assert!(log.contains("[stdout] expanded"));
+        assert_eq!(log, "expanded\n");
+        assert_eq!(log_path.parent(), Some(log_dir.join("env").as_path()));
+        assert!(!stderr_path.exists());
     }
 
     #[tokio::test]
@@ -693,6 +725,73 @@ mod tests {
             .expect("completed job should have a log path");
         let log = tokio::fs::read_to_string(log_path).await.unwrap();
 
-        assert!(log.contains("[stdout] from-group"));
+        assert_eq!(log, "from-group\n");
+    }
+
+    #[tokio::test]
+    async fn run_job_inner_writes_stderr_to_separate_lazy_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "streams".to_string(),
+            command: "printf 'out\\n'; printf 'err\\n' >&2".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let log_dir = temp.path().join("logs");
+        tokio::fs::create_dir_all(&log_dir).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+
+        run_job_inner(
+            job,
+            log_dir,
+            temp.path().join("sundiald.log"),
+            alert,
+            temp.path().to_path_buf(),
+            history,
+            Arc::clone(&state),
+            control_rx,
+            false,
+            RunTrigger::Manual,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = state.lock().await;
+        let stdout_path = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.uuid == job_id)
+            .and_then(|job| job.log_path.as_ref())
+            .expect("completed job should have a stdout log path");
+        let stderr_path = stdout_path.with_file_name(
+            stdout_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace(".stdout.log", ".stderr.log"),
+        );
+
+        assert_eq!(
+            tokio::fs::read_to_string(stdout_path).await.unwrap(),
+            "out\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(stderr_path).await.unwrap(),
+            "err\n"
+        );
     }
 }

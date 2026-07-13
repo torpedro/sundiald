@@ -159,14 +159,17 @@ fn colored_status(job: &service::JobStatusResponse) -> String {
 }
 
 fn colored_service_status(service: &service::ServiceStatusResponse) -> String {
-    let status = match service.status {
-        state::JobStatus::Running => "running".yellow().to_string(),
-        state::JobStatus::Failed | state::JobStatus::StartFailed => {
+    let status = match (&service.status, service.expected_running) {
+        (state::JobStatus::Running, true) => "running".green().to_string(),
+        (state::JobStatus::Running, false) => "running".red().to_string(),
+        (state::JobStatus::Idle, true) => "never run".red().to_string(),
+        (state::JobStatus::Succeeded, true) => "last run succeeded".red().to_string(),
+        (state::JobStatus::Failed | state::JobStatus::StartFailed, _) => {
             "last run failed".red().to_string()
         }
-        state::JobStatus::Succeeded => "last run succeeded".green().to_string(),
-        state::JobStatus::Interrupted => "last run interrupted".yellow().to_string(),
-        state::JobStatus::Idle => "never run".to_string(),
+        (state::JobStatus::Succeeded, false) => "last run succeeded".green().to_string(),
+        (state::JobStatus::Interrupted, _) => "last run interrupted".yellow().to_string(),
+        (state::JobStatus::Idle, false) => "never run".to_string(),
     };
 
     if matches!(service.status, state::JobStatus::Running) {

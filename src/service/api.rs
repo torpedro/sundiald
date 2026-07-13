@@ -90,6 +90,7 @@ pub struct ServiceStatusResponse {
     pub last_error: Option<String>,
     pub terminated_by_signal: Option<String>,
     pub schedule: String,
+    pub expected_running: bool,
     pub next_start: Option<DateTime<Local>>,
     pub next_stop: Option<DateTime<Local>>,
 }
@@ -800,7 +801,12 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
     // (genuinely removed, not renamed — a rename keeps its uuid and is
     // already handled above) would otherwise vanish from status entirely,
     // leaving no way to even discover the name needed to terminate/kill it.
-    let configured_ids: HashSet<Uuid> = config.jobs.iter().filter_map(|job| job.uuid).collect();
+    let configured_ids: HashSet<Uuid> = config
+        .jobs
+        .iter()
+        .filter_map(|job| job.uuid)
+        .chain(config.services.iter().filter_map(|service| service.uuid))
+        .collect();
     for (uuid, state) in &by_id {
         if configured_ids.contains(uuid) || !state.status.is_running() {
             continue;
@@ -853,6 +859,10 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                     )
                 }
             };
+            let expected_running = match &service.schedule {
+                ServiceSchedule::Permanent => true,
+                ServiceSchedule::Window { .. } => super::service_is_inside_runtime(service, now),
+            };
             ServiceStatusResponse {
                 uuid,
                 name: service.name.clone(),
@@ -870,6 +880,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
                 last_error: state.and_then(|state| state.last_error.clone()),
                 terminated_by_signal: state.and_then(|state| state.terminated_by_signal.clone()),
                 schedule,
+                expected_running,
                 next_start,
                 next_stop,
             }
@@ -1195,6 +1206,30 @@ mod tests {
             ServiceCommand::Start(service) if service == "worker"
         ));
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn api_status_does_not_duplicate_running_services_as_orphan_jobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path().to_path_buf());
+        let job_id = config.jobs[0].uuid.unwrap();
+        let service = test_service("worker");
+        let service_id = service.uuid.unwrap();
+        config.services.push(service);
+        let mut snapshot = StateSnapshot::new(vec![
+            (job_id, "sleepy".to_string()),
+            (service_id, "worker".to_string()),
+        ]);
+        snapshot.upsert(running_job_state(service_id, "worker"));
+        let api = test_api(config, snapshot);
+
+        let status = build_status_response(&api).await;
+
+        assert_eq!(status.jobs.len(), 1);
+        assert_eq!(status.jobs[0].name, "sleepy");
+        assert_eq!(status.services.len(), 1);
+        assert_eq!(status.services[0].name, "worker");
+        assert!(matches!(status.services[0].status, JobStatus::Running));
     }
 
     #[tokio::test]

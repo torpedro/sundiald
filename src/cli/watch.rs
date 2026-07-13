@@ -55,6 +55,7 @@ struct UiEntry {
     terminated_by_signal: Option<String>,
     manual_pending: bool,
     trigger_label: String,
+    expected_running: bool,
     next_label: String,
     next_runs: Vec<chrono::DateTime<Local>>,
     next_start: Option<chrono::DateTime<Local>>,
@@ -89,6 +90,7 @@ impl UiEntry {
             terminated_by_signal: job.terminated_by_signal,
             manual_pending: job.manual_pending,
             trigger_label,
+            expected_running: false,
             next_label,
             next_runs: job.next_runs,
             next_start: None,
@@ -121,6 +123,7 @@ impl UiEntry {
             terminated_by_signal: service.terminated_by_signal,
             manual_pending: false,
             trigger_label: service.schedule,
+            expected_running: service.expected_running,
             next_label,
             next_runs: Vec::new(),
             next_start: service.next_start,
@@ -533,6 +536,21 @@ fn status_cell(entry: &UiEntry) -> Cell<'static> {
 }
 
 fn status_style(entry: &UiEntry) -> Style {
+    if matches!(entry.kind, EntryKind::Service) {
+        let running = matches!(entry.status, state::JobStatus::Running);
+        return match (running, entry.expected_running) {
+            (true, true) => Style::default().fg(Color::Green),
+            (false, true) | (true, false) => Style::default().fg(Color::Red),
+            (false, false) => match entry.status {
+                state::JobStatus::Failed | state::JobStatus::StartFailed => {
+                    Style::default().fg(Color::Red)
+                }
+                state::JobStatus::Interrupted => Style::default().fg(Color::Yellow),
+                _ => Style::default(),
+            },
+        };
+    }
+
     match entry.status {
         state::JobStatus::Succeeded => Style::default().fg(Color::Green),
         state::JobStatus::Failed | state::JobStatus::StartFailed => Style::default().fg(Color::Red),
@@ -836,6 +854,29 @@ mod tests {
         })
     }
 
+    fn service_entry(status: crate::state::JobStatus, expected_running: bool) -> UiEntry {
+        UiEntry {
+            kind: EntryKind::Service,
+            uuid: Uuid::new_v4(),
+            name: "worker".to_string(),
+            group: None,
+            status,
+            pid: None,
+            started_at: None,
+            finished_at: None,
+            exit_code: None,
+            last_error: None,
+            terminated_by_signal: None,
+            manual_pending: false,
+            trigger_label: "permanent".to_string(),
+            expected_running,
+            next_label: "manual".to_string(),
+            next_runs: Vec::new(),
+            next_start: None,
+            next_stop: None,
+        }
+    }
+
     #[test]
     fn render_schedule_lists_next_runs_for_selected_job() {
         let mut job = job_entry();
@@ -894,6 +935,19 @@ mod tests {
 
         assert_eq!(status_style(&success).fg, Some(Color::Green));
         assert_eq!(status_style(&failed).fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn service_status_colors_expected_runtime() {
+        let running_expected = service_entry(crate::state::JobStatus::Running, true);
+        let idle_expected = service_entry(crate::state::JobStatus::Idle, true);
+        let running_unexpected = service_entry(crate::state::JobStatus::Running, false);
+        let idle_unexpected = service_entry(crate::state::JobStatus::Idle, false);
+
+        assert_eq!(status_style(&running_expected).fg, Some(Color::Green));
+        assert_eq!(status_style(&idle_expected).fg, Some(Color::Red));
+        assert_eq!(status_style(&running_unexpected).fg, Some(Color::Red));
+        assert_eq!(status_style(&idle_unexpected).fg, None);
     }
 
     #[test]

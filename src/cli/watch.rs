@@ -130,13 +130,6 @@ impl UiEntry {
             next_stop: service.next_stop,
         }
     }
-
-    fn label(&self) -> &'static str {
-        match self.kind {
-            EntryKind::Job => "job",
-            EntryKind::Service => "service",
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -374,47 +367,26 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let mut row_index = 0usize;
     let mut rows = Vec::new();
 
-    for (group, entries) in group_entries(&state.entries) {
-        rows.push(
-            Row::new(vec![
-                Cell::from(group.unwrap_or_else(|| "inline".to_string())),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-                Cell::from(""),
-            ])
-            .style(
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        );
-        row_index += 1;
-
-        for (entry_index, entry) in entries {
-            if entry_index == state.selected {
-                selected_row = Some(row_index);
-            }
-            rows.push(Row::new(vec![
-                Cell::from(format!("  {} {}", entry.label(), entry.name)),
-                status_cell(entry),
-                Cell::from(entry.trigger_label.clone()),
-                Cell::from(format_last_run(entry, now)),
-                Cell::from(entry.next_label.clone()),
-            ]));
-            row_index += 1;
-        }
-    }
-
-    if rows.is_empty() {
-        rows.push(Row::new(vec![
-            Cell::from("no jobs or services"),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-            Cell::from(""),
-        ]));
-    }
+    push_section_rows(
+        &mut rows,
+        &mut row_index,
+        &mut selected_row,
+        state,
+        EntryKind::Job,
+        "Jobs",
+        "no jobs",
+        now,
+    );
+    push_section_rows(
+        &mut rows,
+        &mut row_index,
+        &mut selected_row,
+        state,
+        EntryKind::Service,
+        "Services",
+        "no services",
+        now,
+    );
 
     let table = Table::new(
         rows,
@@ -447,6 +419,77 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     frame.render_stateful_widget(table, area, &mut table_state);
 }
 
+#[allow(clippy::too_many_arguments)]
+fn push_section_rows(
+    rows: &mut Vec<Row<'static>>,
+    row_index: &mut usize,
+    selected_row: &mut Option<usize>,
+    state: &UiState,
+    kind: EntryKind,
+    title: &str,
+    empty_label: &str,
+    now: chrono::DateTime<Local>,
+) {
+    rows.push(
+        Row::new(vec![
+            Cell::from(title.to_string()),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ])
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    );
+    *row_index += 1;
+
+    let groups = group_entries(&state.entries, kind);
+    if groups.is_empty() {
+        rows.push(Row::new(vec![
+            Cell::from(format!("  {empty_label}")),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(""),
+        ]));
+        *row_index += 1;
+        return;
+    }
+
+    for (group, entries) in groups {
+        if let Some(group) = group {
+            rows.push(
+                Row::new(vec![
+                    Cell::from(format!("  {group}")),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                    Cell::from(""),
+                ])
+                .style(Style::default().fg(Color::Cyan)),
+            );
+            *row_index += 1;
+        }
+
+        for (entry_index, entry) in entries {
+            if entry_index == state.selected {
+                *selected_row = Some(*row_index);
+            }
+            rows.push(Row::new(vec![
+                Cell::from(format!("  {}", entry.name)),
+                status_cell(entry),
+                Cell::from(entry.trigger_label.clone()),
+                Cell::from(format_last_run(entry, now)),
+                Cell::from(entry.next_label.clone()),
+            ]));
+            *row_index += 1;
+        }
+    }
+}
+
 fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let title = match state.detail_mode {
         DetailMode::None => state.detail_title.clone(),
@@ -469,9 +512,15 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
-fn group_entries(entries: &[UiEntry]) -> Vec<(Option<String>, Vec<(usize, &UiEntry)>)> {
+fn group_entries(
+    entries: &[UiEntry],
+    kind: EntryKind,
+) -> Vec<(Option<String>, Vec<(usize, &UiEntry)>)> {
     let mut groups: Vec<(Option<String>, Vec<(usize, &UiEntry)>)> = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
+        if entry.kind != kind {
+            continue;
+        }
         let group = entry.group.clone();
         if let Some((_, group_entries)) = groups.iter_mut().find(|(existing, _)| *existing == group)
         {
@@ -957,9 +1006,10 @@ mod tests {
         let mut second = job_entry();
         second.name = "cleanup".to_string();
         second.group = Some("maintenance".to_string());
-        let entries = vec![first, second];
+        let service = service_entry(crate::state::JobStatus::Running, true);
+        let entries = vec![first, service, second];
 
-        let groups = group_entries(&entries);
+        let groups = group_entries(&entries, EntryKind::Job);
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].0, None);

@@ -191,7 +191,7 @@ pub(crate) fn format_last_run(job: &service::JobStatusResponse, now: DateTime<Lo
         let Some(started) = job.started_at else {
             return "never".to_string();
         };
-        let elapsed = format_duration_precise(now.signed_duration_since(started));
+        let elapsed = format_duration(now.signed_duration_since(started));
         return format!("{} (running for {elapsed})", format_timestamp(started));
     }
 
@@ -202,7 +202,7 @@ pub(crate) fn format_last_run(job: &service::JobStatusResponse, now: DateTime<Lo
 
     match (job.started_at, job.finished_at) {
         (Some(started), Some(finished)) => {
-            let took = format_duration_precise(finished.signed_duration_since(started));
+            let took = format_duration(finished.signed_duration_since(started));
             format!("{} ({ago} ago, took {took})", format_timestamp(time))
         }
         _ => format!("{} ({ago} ago)", format_timestamp(time)),
@@ -217,7 +217,7 @@ fn format_service_last_run(
         let Some(started) = service.started_at else {
             return "never".to_string();
         };
-        let elapsed = format_duration_precise(now.signed_duration_since(started));
+        let elapsed = format_duration(now.signed_duration_since(started));
         return format!("{} (running for {elapsed})", format_timestamp(started));
     }
 
@@ -228,7 +228,7 @@ fn format_service_last_run(
 
     match (service.started_at, service.finished_at) {
         (Some(started), Some(finished)) => {
-            let took = format_duration_precise(finished.signed_duration_since(started));
+            let took = format_duration(finished.signed_duration_since(started));
             format!("{} ({ago} ago, took {took})", format_timestamp(time))
         }
         _ => format!("{} ({ago} ago)", format_timestamp(time)),
@@ -296,30 +296,6 @@ fn format_duration(duration: chrono::Duration) -> String {
     format_duration_seconds(total_seconds)
 }
 
-fn format_duration_precise(duration: chrono::Duration) -> String {
-    let total_milliseconds = duration.num_milliseconds().max(0);
-    let total_seconds = total_milliseconds / 1_000;
-    let milliseconds = total_milliseconds % 1_000;
-    let days = total_seconds / 86_400;
-    let hours = (total_seconds % 86_400) / 3_600;
-    let minutes = (total_seconds % 3_600) / 60;
-    let seconds = total_seconds % 60;
-    let mut parts = Vec::new();
-
-    if days > 0 {
-        parts.push(format!("{days}d"));
-    }
-    if hours > 0 {
-        parts.push(format!("{hours}h"));
-    }
-    if minutes > 0 {
-        parts.push(format!("{minutes}m"));
-    }
-    parts.push(format!("{seconds}.{milliseconds:03}s"));
-
-    parts.join(" ")
-}
-
 fn format_duration_seconds(total_seconds: i64) -> String {
     let days = total_seconds / 86_400;
     let hours = (total_seconds % 86_400) / 3_600;
@@ -381,26 +357,6 @@ mod tests {
         assert_eq!(format_duration(chrono::Duration::seconds(90)), "1m 30s");
         assert_eq!(format_duration(chrono::Duration::seconds(3661)), "1h 1m 1s");
         assert_eq!(format_duration(chrono::Duration::seconds(90_000)), "1d 1h");
-        assert_eq!(
-            format_duration_precise(chrono::Duration::milliseconds(250)),
-            "0.250s"
-        );
-        assert_eq!(
-            format_duration_precise(chrono::Duration::milliseconds(1250)),
-            "1.250s"
-        );
-        assert_eq!(
-            format_duration_precise(chrono::Duration::seconds(5)),
-            "5.000s"
-        );
-        assert_eq!(
-            format_duration_precise(chrono::Duration::milliseconds(75_250)),
-            "1m 15.250s"
-        );
-        assert_eq!(
-            format_duration_precise(chrono::Duration::milliseconds(7_384_005)),
-            "2h 3m 4.005s"
-        );
     }
 
     #[test]
@@ -417,7 +373,7 @@ mod tests {
         let mut job = job_response(state::JobStatus::Running);
         job.started_at = Some(Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
 
-        assert!(format_last_run(&job, now).ends_with("(running for 10.000s)"));
+        assert!(format_last_run(&job, now).ends_with("(running for 10s)"));
     }
 
     #[test]
@@ -427,7 +383,7 @@ mod tests {
         job.started_at = Some(Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap());
         job.finished_at = Some(Local.with_ymd_and_hms(2026, 1, 1, 12, 0, 5).unwrap());
 
-        assert!(format_last_run(&job, now).ends_with("(55s ago, took 5.000s)"));
+        assert!(format_last_run(&job, now).ends_with("(55s ago, took 5s)"));
     }
 
     #[test]

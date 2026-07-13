@@ -645,8 +645,31 @@ fn format_time_with_delta(time: chrono::DateTime<Local>, now: chrono::DateTime<L
 }
 
 fn format_chrono_duration(duration: chrono::Duration) -> String {
-    let milliseconds = duration.num_milliseconds().max(0);
-    format_duration_ms(milliseconds)
+    let seconds = duration.num_seconds().max(0);
+    format_duration_seconds(seconds)
+}
+
+fn format_duration_seconds(total_seconds: i64) -> String {
+    let days = total_seconds / 86_400;
+    let hours = (total_seconds % 86_400) / 3_600;
+    let minutes = (total_seconds % 3_600) / 60;
+    let seconds = total_seconds % 60;
+    let mut parts = Vec::new();
+
+    if days > 0 {
+        parts.push(format!("{days}d"));
+    }
+    if hours > 0 {
+        parts.push(format!("{hours}h"));
+    }
+    if minutes > 0 {
+        parts.push(format!("{minutes}m"));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds}s"));
+    }
+
+    parts.join(" ")
 }
 
 fn render_schedule(entry: &UiEntry) -> String {
@@ -947,6 +970,33 @@ mod tests {
         job.trigger_label = "manual".to_string();
 
         assert_eq!(render_schedule(&job), "trigger: example is manual");
+    }
+
+    #[test]
+    fn last_and_next_run_durations_do_not_show_milliseconds() {
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 0)
+            .unwrap();
+        let mut job = job_entry();
+        job.status = crate::state::JobStatus::Succeeded;
+        job.started_at = Some(
+            chrono::Local
+                .with_ymd_and_hms(2026, 1, 1, 11, 59, 30)
+                .unwrap(),
+        );
+        job.finished_at = Some(
+            chrono::Local
+                .with_ymd_and_hms(2026, 1, 1, 11, 59, 35)
+                .unwrap(),
+        );
+        let next = chrono::Local
+            .with_ymd_and_hms(2026, 1, 1, 12, 0, 30)
+            .unwrap();
+
+        assert!(format_last_run(&job, now).contains("took 5s"));
+        assert!(!format_last_run(&job, now).contains(".000s"));
+        assert!(format_time_with_delta(next, now).contains("in 30s"));
+        assert!(!format_time_with_delta(next, now).contains(".000s"));
     }
 
     #[test]

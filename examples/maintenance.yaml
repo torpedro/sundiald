@@ -13,3 +13,9 @@ jobs:
     command: "/usr/local/bin/publish-report"
     trigger:
       after: rebuild-report
+services:
+  - name: report-watcher
+    command: "/usr/local/bin/report-watcher"
+    schedule:
+      start: "0 0 8 * * mon-fri"
+      stop: "0 0 18 * * mon-fri"

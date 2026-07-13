@@ -55,6 +55,30 @@ enum Command {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    /// Start a configured service.
+    StartService {
+        /// Service name or UUID to start.
+        service: String,
+        /// YAML config file to load.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Stop a running service with SIGTERM.
+    StopService {
+        /// Service name or UUID to stop.
+        service: String,
+        /// YAML config file to load.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    /// Stop a running service with SIGKILL.
+    KillService {
+        /// Service name or UUID to kill.
+        service: String,
+        /// YAML config file to load.
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
     /// Tell the running service to reload its config from disk.
     Reload {
         /// YAML config file to load (used to locate the running service's API).
@@ -146,6 +170,23 @@ async fn main() -> Result<()> {
                     None => println!("- {} [no uuid yet{group}]: {}", job.name, job.command),
                 }
             }
+            println!("services: {}", config.services.len());
+            for service in &config.services {
+                let group = service
+                    .group
+                    .as_deref()
+                    .map(|group| format!(" group={group}"))
+                    .unwrap_or_default();
+                match service.uuid {
+                    Some(uuid) => {
+                        println!("- {} [{uuid}{group}]: {}", service.name, service.command)
+                    }
+                    None => println!(
+                        "- {} [no uuid yet{group}]: {}",
+                        service.name, service.command
+                    ),
+                }
+            }
             Ok(())
         }
         Command::Run { job, config } => {
@@ -174,6 +215,39 @@ async fn main() -> Result<()> {
             let config = resolve_config_path(config);
             let config = SundialdConfig::load(&config)?;
             cli::post_job_action(&config, &job, "kill", &format!("sent SIGKILL to {job}")).await
+        }
+        Command::StartService { service, config } => {
+            let config = resolve_config_path(config);
+            let config = SundialdConfig::load(&config)?;
+            cli::post_service_action(
+                &config,
+                &service,
+                "start",
+                &format!("queued service start for {service}"),
+            )
+            .await
+        }
+        Command::StopService { service, config } => {
+            let config = resolve_config_path(config);
+            let config = SundialdConfig::load(&config)?;
+            cli::post_service_action(
+                &config,
+                &service,
+                "stop",
+                &format!("sent SIGTERM to {service}"),
+            )
+            .await
+        }
+        Command::KillService { service, config } => {
+            let config = resolve_config_path(config);
+            let config = SundialdConfig::load(&config)?;
+            cli::post_service_action(
+                &config,
+                &service,
+                "kill",
+                &format!("sent SIGKILL to {service}"),
+            )
+            .await
         }
         Command::Reload { config } => {
             let config = resolve_config_path(config);

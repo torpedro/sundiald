@@ -35,6 +35,8 @@ pub struct SundialdConfig {
     pub job_files: Vec<JobFileConfig>,
     #[serde(default)]
     pub jobs: Vec<JobConfig>,
+    #[serde(default)]
+    pub services: Vec<ServiceConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -49,12 +51,15 @@ pub struct JobFileConfig {
 struct JobFileContents {
     #[serde(default)]
     pub env: HashMap<String, String>,
+    #[serde(default)]
     pub jobs: Vec<JobConfig>,
+    #[serde(default)]
+    pub services: Vec<ServiceConfig>,
 }
 
 impl JobFileContents {
-    fn into_parts(self) -> (HashMap<String, String>, Vec<JobConfig>) {
-        (self.env, self.jobs)
+    fn into_parts(self) -> (HashMap<String, String>, Vec<JobConfig>, Vec<ServiceConfig>) {
+        (self.env, self.jobs, self.services)
     }
 }
 
@@ -125,6 +130,83 @@ pub struct JobConfig {
     /// the right source file without re-serializing unrelated config.
     #[serde(skip)]
     pub source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ServiceConfig {
+    #[serde(default)]
+    pub uuid: Option<Uuid>,
+    pub name: String,
+    pub command: String,
+    pub schedule: ServiceSchedule,
+    #[serde(default)]
+    pub stop_grace_period: Option<String>,
+    #[serde(skip)]
+    pub group: Option<String>,
+    #[serde(skip)]
+    pub env: HashMap<String, String>,
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ServiceSchedule {
+    Permanent,
+    Window { start: Schedule, stop: Schedule },
+}
+
+impl<'de> Deserialize<'de> for ServiceSchedule {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        use serde::de::Error;
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Window {
+            start: Schedule,
+            stop: Schedule,
+        }
+
+        let value = serde_yaml::Value::deserialize(deserializer)?;
+        match value {
+            serde_yaml::Value::String(value) if value == "permanent" => Ok(Self::Permanent),
+            serde_yaml::Value::Mapping(_) => {
+                let window: Window = serde_yaml::from_value(value)
+                    .map_err(|error| D::Error::custom(error.to_string()))?;
+                Ok(Self::Window {
+                    start: window.start,
+                    stop: window.stop,
+                })
+            }
+            _ => Err(D::Error::custom(
+                "service schedule must be 'permanent' or a map containing start and stop",
+            )),
+        }
+    }
+}
+
+impl ServiceConfig {
+    pub fn stop_grace(&self) -> std::time::Duration {
+        self.stop_grace_period
+            .as_deref()
+            .and_then(|value| duration::parse_duration(value).ok())
+            .unwrap_or_else(|| std::time::Duration::from_secs(30))
+    }
+
+    pub fn as_job_config(&self) -> JobConfig {
+        JobConfig {
+            uuid: self.uuid,
+            name: self.name.clone(),
+            command: self.command.clone(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: self.group.clone(),
+            env: self.env.clone(),
+            source_path: self.source_path.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +328,10 @@ impl SundialdConfig {
             job.env = self.env.clone();
             job.source_path = Some(config_path.to_path_buf());
         }
+        for service in &mut self.services {
+            service.env = self.env.clone();
+            service.source_path = Some(config_path.to_path_buf());
+        }
 
         let config_dir = config_path.parent().unwrap_or_else(|| Path::new("."));
         for job_file in &self.job_files {
@@ -254,7 +340,7 @@ impl SundialdConfig {
                 .with_context(|| format!("failed to read job file {}", path.display()))?;
             let contents: JobFileContents = serde_yaml::from_str(&raw)
                 .with_context(|| format!("failed to parse job file {}", path.display()))?;
-            let (env, mut jobs) = contents.into_parts();
+            let (env, mut jobs, mut services) = contents.into_parts();
             validate_env(
                 &env,
                 &format!("job file '{}' ({})", job_file.name, path.display()),
@@ -265,6 +351,12 @@ impl SundialdConfig {
                 job.source_path = Some(path.clone());
             }
             self.jobs.extend(jobs);
+            for service in &mut services {
+                service.group = Some(job_file.name.clone());
+                service.env = env.clone();
+                service.source_path = Some(path.clone());
+            }
+            self.services.extend(services);
         }
         Ok(())
     }
@@ -305,6 +397,7 @@ impl SundialdConfig {
         }
 
         let mut names = HashSet::new();
+        let mut job_names = HashSet::new();
         let mut uuids = HashSet::new();
         for job in &self.jobs {
             let job_context = job_context(job);
@@ -314,6 +407,7 @@ impl SundialdConfig {
             if !names.insert(job.name.clone()) {
                 bail!("duplicate job name '{}' ({job_context})", job.name);
             }
+            job_names.insert(job.name.clone());
             if let Some(uuid) = job.uuid {
                 if !uuids.insert(uuid) {
                     bail!("duplicate job uuid '{uuid}' ({job_context})");
@@ -334,13 +428,49 @@ impl SundialdConfig {
             }
         }
 
+        for service in &self.services {
+            let service_context = service_context(service);
+            if service.name.trim().is_empty() {
+                bail!("service name cannot be empty ({service_context})");
+            }
+            if !names.insert(service.name.clone()) {
+                bail!(
+                    "duplicate service name '{}' ({service_context})",
+                    service.name
+                );
+            }
+            if let Some(uuid) = service.uuid {
+                if !uuids.insert(uuid) {
+                    bail!("duplicate service uuid '{uuid}' ({service_context})");
+                }
+            }
+            if service.command.trim().is_empty() {
+                bail!("service command cannot be empty ({service_context})");
+            }
+            if let Some(duration) = &service.stop_grace_period {
+                duration::parse_duration(duration)
+                    .with_context(|| format!("invalid stop_grace_period ({service_context})"))?;
+            }
+            match &service.schedule {
+                ServiceSchedule::Permanent => {}
+                ServiceSchedule::Window { start, stop } => {
+                    start.validate().with_context(|| {
+                        format!("invalid service start schedule ({service_context})")
+                    })?;
+                    stop.validate().with_context(|| {
+                        format!("invalid service stop schedule ({service_context})")
+                    })?;
+                }
+            }
+        }
+
         for job in &self.jobs {
             let job_context = job_context(job);
             if let JobTrigger::After(upstream) = &job.trigger {
                 if upstream.trim().is_empty() {
                     bail!("trigger.after cannot be empty ({job_context})");
                 }
-                if !names.contains(upstream) {
+                if !job_names.contains(upstream) {
                     bail!("unknown trigger.after job '{upstream}' ({job_context})");
                 }
             }
@@ -375,6 +505,19 @@ impl SundialdConfig {
                     Uuid::new_v4(),
                 )
             })
+            .chain(
+                config
+                    .services
+                    .iter()
+                    .filter(|service| service.uuid.is_none())
+                    .map(|service| {
+                        (
+                            service.source_path.clone().unwrap_or_else(|| path.clone()),
+                            service.name.clone(),
+                            Uuid::new_v4(),
+                        )
+                    }),
+            )
             .collect();
         if missing.is_empty() {
             return Ok(config);
@@ -412,6 +555,11 @@ impl SundialdConfig {
                 job.uuid = assigned.get(job.name.as_str()).copied();
             }
         }
+        for service in &mut config.services {
+            if service.uuid.is_none() {
+                service.uuid = assigned.get(service.name.as_str()).copied();
+            }
+        }
 
         Ok(config)
     }
@@ -443,6 +591,17 @@ fn job_context(job: &JobConfig) -> String {
         context.push_str(&format!(", group '{group}'"));
     }
     if let Some(source_path) = &job.source_path {
+        context.push_str(&format!(", file {}", source_path.display()));
+    }
+    context
+}
+
+fn service_context(service: &ServiceConfig) -> String {
+    let mut context = format!("service '{}'", service.name);
+    if let Some(group) = &service.group {
+        context.push_str(&format!(", group '{group}'"));
+    }
+    if let Some(source_path) = &service.source_path {
         context.push_str(&format!(", file {}", source_path.display()));
     }
     context
@@ -525,11 +684,11 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
-# Environment variables inherited by inline jobs in this file.
+# Environment variables inherited by inline jobs and services in this file.
 env:
   APP_ENV: production
-# Optional named files containing additional job definitions.
-# Each file is a YAML map with optional `env` and a required `jobs` list.
+# Optional named files containing additional job and service definitions.
+# Each file is a YAML map with optional `env`, `jobs`, and `services` lists.
 # job_files:
 #   - name: maintenance
 #     path: maintenance.yaml
@@ -550,6 +709,18 @@ jobs:
     uuid: 14036dee-250c-4625-a3d6-21a068f82a4a
     command: "echo this job fails; exit 42"
     trigger: manual
+services:
+  - name: web
+    uuid: 3e6012cb-d80f-4645-9b1f-15b943b35a83
+    command: "python3 -m http.server 8080"
+    schedule: permanent
+  - name: office-worker
+    uuid: 8bb33865-08a4-47ef-bdbf-028108c99c42
+    command: "bin/worker"
+    stop_grace_period: "45s"
+    schedule:
+      start: "0 0 9 * * mon-fri"
+      stop: "0 0 17 * * mon-fri"
 "#,
         state_dir = default_state_dir().display(),
         log_dir = default_log_dir().display(),
@@ -676,6 +847,72 @@ jobs:
         .unwrap();
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_completion_trigger_for_service_name() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+jobs:
+  - name: deploy
+    command: "true"
+    trigger:
+      after: worker
+services:
+  - name: worker
+    command: "sleep 60"
+    schedule: permanent
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_accepts_services_with_permanent_and_window_schedules() {
+        let mut config: SundialdConfig = serde_yaml::from_str(
+            r#"
+env:
+  APP_ENV: production
+services:
+  - name: api
+    command: "bin/api"
+    schedule: permanent
+  - name: worker
+    command: "bin/worker"
+    stop_grace_period: 45s
+    schedule:
+      start: "0 0 9 * * *"
+      stop: "0 0 17 * * *"
+"#,
+        )
+        .unwrap();
+
+        let config_path = PathBuf::from("sundiald.yaml");
+        for service in &mut config.services {
+            service.env = config.env.clone();
+            service.source_path = Some(config_path.clone());
+        }
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.services.len(), 2);
+        assert!(matches!(
+            config.services[0].schedule,
+            ServiceSchedule::Permanent
+        ));
+        assert!(matches!(
+            config.services[1].schedule,
+            ServiceSchedule::Window { .. }
+        ));
+        assert_eq!(
+            config.services[0].env.get("APP_ENV").map(String::as_str),
+            Some("production")
+        );
+        assert_eq!(
+            config.services[1].stop_grace(),
+            std::time::Duration::from_secs(45)
+        );
     }
 
     #[test]
@@ -955,7 +1192,7 @@ alert:
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/maintenance.yaml");
         let example = std::fs::read_to_string(example_path).unwrap();
         let contents: JobFileContents = serde_yaml::from_str(&example).unwrap();
-        let (env, jobs) = contents.into_parts();
+        let (env, jobs, services) = contents.into_parts();
         let config = SundialdConfig {
             state_dir: default_state_dir(),
             log_dir: default_log_dir(),
@@ -966,6 +1203,7 @@ alert:
             env: HashMap::new(),
             job_files: Vec::new(),
             jobs,
+            services,
         };
 
         assert_eq!(env.get("APP_ENV").map(String::as_str), Some("production"));

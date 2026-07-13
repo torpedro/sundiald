@@ -31,6 +31,17 @@ pub(crate) async fn post_job_action(
     report_response(response, action, success_message).await
 }
 
+pub(crate) async fn post_service_action(
+    config: &SundialdConfig,
+    service: &str,
+    action: &str,
+    success_message: &str,
+) -> Result<()> {
+    let service = encode_path_segment(service);
+    let response = post_api(config, &format!("/services/{service}/{action}")).await?;
+    report_response(response, action, success_message).await
+}
+
 pub(crate) async fn reload_config(config: &SundialdConfig) -> Result<()> {
     let response = post_api(config, "/reload").await?;
     report_response(response, "reload", "config reloaded").await

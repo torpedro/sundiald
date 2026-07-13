@@ -219,7 +219,7 @@ CREATE TABLE IF NOT EXISTS job_runs (
     job_uuid TEXT NOT NULL,
     job_name TEXT NOT NULL,
     job_group TEXT,
-    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'dependency', 'manual')),
+    trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'dependency', 'manual', 'service_schedule', 'service_manual')),
     triggered_at TEXT NOT NULL,
     finished_at TEXT,
     duration_ms INTEGER,
@@ -246,7 +246,7 @@ fn migrate_trigger_kind_constraint(connection: &Connection) -> Result<()> {
     let Some(table_sql) = table_sql else {
         return Ok(());
     };
-    if !table_sql.contains("'automatic'") {
+    if !table_sql.contains("'automatic'") && table_sql.contains("'service_schedule'") {
         return Ok(());
     }
 
@@ -260,7 +260,7 @@ fn migrate_trigger_kind_constraint(connection: &Connection) -> Result<()> {
             job_uuid TEXT NOT NULL,
             job_name TEXT NOT NULL,
             job_group TEXT,
-            trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'dependency', 'manual')),
+            trigger_kind TEXT NOT NULL CHECK (trigger_kind IN ('schedule', 'dependency', 'manual', 'service_schedule', 'service_manual')),
             triggered_at TEXT NOT NULL,
             finished_at TEXT,
             duration_ms INTEGER,
@@ -519,5 +519,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(trigger_kind, "schedule");
+    }
+
+    #[tokio::test]
+    async fn accepts_service_trigger_kinds() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let job = JobConfig {
+            uuid: Some(Uuid::new_v4()),
+            name: "worker".to_string(),
+            command: "true".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: std::collections::HashMap::new(),
+            source_path: None,
+        };
+
+        let run_id = history
+            .record_triggered(
+                &job,
+                Local::now(),
+                "service_manual",
+                &temp.path().join("worker.log"),
+            )
+            .await
+            .unwrap();
+
+        assert!(run_id > 0);
     }
 }

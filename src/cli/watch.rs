@@ -23,10 +23,7 @@ use tokio::{
     time::{self, Duration},
 };
 
-use super::{
-    client::{api_base, encode_path_segment, fetch_status},
-    render::{format_last_run, format_next_run_plain, group_jobs, high_level_status},
-};
+use super::client::{api_base, encode_path_segment, fetch_status};
 use crate::{config::SundialdConfig, service, state};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +34,112 @@ enum DetailMode {
     Schedule,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Job,
+    Service,
+}
+
+#[derive(Debug, Clone)]
+struct UiEntry {
+    kind: EntryKind,
+    uuid: uuid::Uuid,
+    name: String,
+    group: Option<String>,
+    status: state::JobStatus,
+    pid: Option<u32>,
+    started_at: Option<chrono::DateTime<Local>>,
+    finished_at: Option<chrono::DateTime<Local>>,
+    exit_code: Option<i32>,
+    last_error: Option<String>,
+    terminated_by_signal: Option<String>,
+    manual_pending: bool,
+    trigger_label: String,
+    next_label: String,
+    next_runs: Vec<chrono::DateTime<Local>>,
+    next_start: Option<chrono::DateTime<Local>>,
+    next_stop: Option<chrono::DateTime<Local>>,
+}
+
+impl UiEntry {
+    fn from_job(job: service::JobStatusResponse) -> Self {
+        let trigger_label = match job.trigger.after.as_deref() {
+            Some(upstream) => format!("after {upstream}"),
+            None => job.trigger.kind.clone(),
+        };
+        let next_label = match job.trigger.kind.as_str() {
+            "manual" => "manual".to_string(),
+            "dependency" => trigger_label.clone(),
+            _ => job
+                .next_run
+                .map(|time| format_time_with_delta(time, Local::now()))
+                .unwrap_or_else(|| "none".to_string()),
+        };
+        Self {
+            kind: EntryKind::Job,
+            uuid: job.uuid,
+            name: job.name,
+            group: job.group,
+            status: job.status,
+            pid: job.pid,
+            started_at: job.started_at,
+            finished_at: job.finished_at,
+            exit_code: job.exit_code,
+            last_error: job.last_error,
+            terminated_by_signal: job.terminated_by_signal,
+            manual_pending: job.manual_pending,
+            trigger_label,
+            next_label,
+            next_runs: job.next_runs,
+            next_start: None,
+            next_stop: None,
+        }
+    }
+
+    fn from_service(service: service::ServiceStatusResponse) -> Self {
+        let next_label = match (service.next_start, service.next_stop) {
+            (Some(start), Some(stop)) => format!(
+                "start {} / stop {}",
+                format_timestamp(start),
+                format_timestamp(stop)
+            ),
+            (Some(start), None) => format!("start {}", format_timestamp(start)),
+            (None, Some(stop)) => format!("stop {}", format_timestamp(stop)),
+            (None, None) => "manual".to_string(),
+        };
+        Self {
+            kind: EntryKind::Service,
+            uuid: service.uuid,
+            name: service.name,
+            group: service.group,
+            status: service.status,
+            pid: service.pid,
+            started_at: service.started_at,
+            finished_at: service.finished_at,
+            exit_code: service.exit_code,
+            last_error: service.last_error,
+            terminated_by_signal: service.terminated_by_signal,
+            manual_pending: false,
+            trigger_label: service.schedule,
+            next_label,
+            next_runs: Vec::new(),
+            next_start: service.next_start,
+            next_stop: service.next_stop,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.kind {
+            EntryKind::Job => "job",
+            EntryKind::Service => "service",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct UiState {
     selected: usize,
-    jobs: Vec<service::JobStatusResponse>,
+    entries: Vec<UiEntry>,
     message: String,
     detail_mode: DetailMode,
     detail_title: String,
@@ -52,23 +151,24 @@ impl UiState {
     fn new() -> Self {
         Self {
             selected: 0,
-            jobs: Vec::new(),
+            entries: Vec::new(),
             message: "ready".to_string(),
             detail_mode: DetailMode::None,
             detail_title: "Details".to_string(),
             detail_text:
-                "Select a job, then press Enter for logs, h for history, or s for schedule."
+                "Select a job or service, then press Enter for logs, h for history, or s for schedule."
                     .to_string(),
             detail_scroll: 0,
         }
     }
 
-    fn selected_job(&self) -> Option<&service::JobStatusResponse> {
-        self.jobs.get(self.selected)
+    fn selected_entry(&self) -> Option<&UiEntry> {
+        self.entries.get(self.selected)
     }
 
-    fn selected_job_action_target(&self) -> Option<(uuid::Uuid, String)> {
-        self.selected_job().map(|job| (job.uuid, job.name.clone()))
+    fn selected_action_target(&self) -> Option<(EntryKind, uuid::Uuid, String)> {
+        self.selected_entry()
+            .map(|entry| (entry.kind, entry.uuid, entry.name.clone()))
     }
 
     fn set_details(&mut self, mode: DetailMode, title: impl Into<String>, text: impl Into<String>) {
@@ -106,7 +206,7 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
                 if handle_key(key, &config, &mut state).await {
                     break;
                 }
-                state.selected = clamp_selected(state.selected, state.jobs.len());
+                state.selected = clamp_selected(state.selected, state.entries.len());
                 terminal.draw(|frame| draw_ui(frame, &config, &state))?;
             }
         }
@@ -120,14 +220,14 @@ async fn handle_key(key: KeyEvent, config: &SundialdConfig, state: &mut UiState)
         KeyCode::Char('q') | KeyCode::Esc => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
         KeyCode::Down | KeyCode::Char('j') => {
-            if !state.jobs.is_empty() {
-                state.selected = (state.selected + 1) % state.jobs.len();
+            if !state.entries.is_empty() {
+                state.selected = (state.selected + 1) % state.entries.len();
             }
         }
         KeyCode::Up | KeyCode::Char('k') => {
-            if !state.jobs.is_empty() {
+            if !state.entries.is_empty() {
                 state.selected = if state.selected == 0 {
-                    state.jobs.len() - 1
+                    state.entries.len() - 1
                 } else {
                     state.selected - 1
                 };
@@ -140,36 +240,41 @@ async fn handle_key(key: KeyEvent, config: &SundialdConfig, state: &mut UiState)
             state.detail_scroll = state.detail_scroll.saturating_sub(8);
         }
         KeyCode::Char('r') => {
-            if let Some((uuid, name)) = state.selected_job_action_target() {
-                let encoded_job_id = encode_path_segment(&uuid.to_string());
-                state.message = post_watch_action(
-                    config,
-                    &format!("/jobs/{encoded_job_id}/run"),
-                    &format!("queued manual run for {name}"),
-                )
-                .await;
+            if let Some((kind, uuid, name)) = state.selected_action_target() {
+                let encoded_id = encode_path_segment(&uuid.to_string());
+                let (path, message) = match kind {
+                    EntryKind::Job => (
+                        format!("/jobs/{encoded_id}/run"),
+                        format!("queued manual run for {name}"),
+                    ),
+                    EntryKind::Service => (
+                        format!("/services/{encoded_id}/start"),
+                        format!("queued service start for {name}"),
+                    ),
+                };
+                state.message = post_watch_action(config, &path, &message).await;
             }
         }
         KeyCode::Char('T') => {
-            if let Some((uuid, name)) = state.selected_job_action_target() {
-                let encoded_job_id = encode_path_segment(&uuid.to_string());
-                state.message = post_watch_action(
-                    config,
-                    &format!("/jobs/{encoded_job_id}/terminate"),
-                    &format!("sent SIGTERM to {name}"),
-                )
-                .await;
+            if let Some((kind, uuid, name)) = state.selected_action_target() {
+                let encoded_id = encode_path_segment(&uuid.to_string());
+                let path = match kind {
+                    EntryKind::Job => format!("/jobs/{encoded_id}/terminate"),
+                    EntryKind::Service => format!("/services/{encoded_id}/stop"),
+                };
+                state.message =
+                    post_watch_action(config, &path, &format!("sent SIGTERM to {name}")).await;
             }
         }
         KeyCode::Char('K') => {
-            if let Some((uuid, name)) = state.selected_job_action_target() {
-                let encoded_job_id = encode_path_segment(&uuid.to_string());
-                state.message = post_watch_action(
-                    config,
-                    &format!("/jobs/{encoded_job_id}/kill"),
-                    &format!("sent SIGKILL to {name}"),
-                )
-                .await;
+            if let Some((kind, uuid, name)) = state.selected_action_target() {
+                let encoded_id = encode_path_segment(&uuid.to_string());
+                let path = match kind {
+                    EntryKind::Job => format!("/jobs/{encoded_id}/kill"),
+                    EntryKind::Service => format!("/services/{encoded_id}/kill"),
+                };
+                state.message =
+                    post_watch_action(config, &path, &format!("sent SIGKILL to {name}")).await;
             }
         }
         KeyCode::Char('R') => {
@@ -177,23 +282,26 @@ async fn handle_key(key: KeyEvent, config: &SundialdConfig, state: &mut UiState)
             refresh_jobs(config, state).await;
         }
         KeyCode::Char('s') => {
-            if let Some(job) = state.selected_job() {
+            if let Some(entry) = state.selected_entry() {
                 state.set_details(
                     DetailMode::Schedule,
-                    format!("Schedule: {}", job.name),
-                    render_schedule(job),
+                    format!("Schedule: {}", entry.name),
+                    render_schedule(entry),
                 );
             }
         }
         KeyCode::Char('h') => {
-            if let Some((uuid, name)) = state.selected_job_action_target() {
-                let history = read_history(config, uuid).await;
+            if let Some((kind, uuid, name)) = state.selected_action_target() {
+                let history = match kind {
+                    EntryKind::Job => read_history(config, uuid).await,
+                    EntryKind::Service => "history: service history is recorded in the run database but has no dedicated UI endpoint yet".to_string(),
+                };
                 state.set_details(DetailMode::History, format!("History: {name}"), history);
             }
         }
         KeyCode::Enter => {
-            if let Some((uuid, name)) = state.selected_job_action_target() {
-                let log = read_recent_log(config, uuid).await;
+            if let Some((kind, uuid, name)) = state.selected_action_target() {
+                let log = read_recent_log(config, kind, uuid).await;
                 state.set_details(DetailMode::Log, format!("Latest Log: {name}"), log);
             }
         }
@@ -209,8 +317,13 @@ async fn handle_key(key: KeyEvent, config: &SundialdConfig, state: &mut UiState)
 async fn refresh_jobs(config: &SundialdConfig, state: &mut UiState) {
     match fetch_status(config).await {
         Ok(status) => {
-            state.jobs = status.jobs;
-            state.selected = clamp_selected(state.selected, state.jobs.len());
+            state.entries = status
+                .jobs
+                .into_iter()
+                .map(UiEntry::from_job)
+                .chain(status.services.into_iter().map(UiEntry::from_service))
+                .collect();
+            state.selected = clamp_selected(state.selected, state.entries.len());
         }
         Err(error) => {
             state.message = format!("status refresh failed: {error}");
@@ -258,7 +371,7 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let mut row_index = 0usize;
     let mut rows = Vec::new();
 
-    for (group, jobs) in group_jobs(&state.jobs) {
+    for (group, entries) in group_entries(&state.entries) {
         rows.push(
             Row::new(vec![
                 Cell::from(group.unwrap_or_else(|| "inline".to_string())),
@@ -275,16 +388,16 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         );
         row_index += 1;
 
-        for (job_index, job) in jobs {
-            if job_index == state.selected {
+        for (entry_index, entry) in entries {
+            if entry_index == state.selected {
                 selected_row = Some(row_index);
             }
             rows.push(Row::new(vec![
-                Cell::from(format!("  {}", job.name)),
-                status_cell(job),
-                Cell::from(compact_trigger(job)),
-                Cell::from(format_last_run(job, now)),
-                Cell::from(format_next_run_plain(job, now)),
+                Cell::from(format!("  {} {}", entry.label(), entry.name)),
+                status_cell(entry),
+                Cell::from(entry.trigger_label.clone()),
+                Cell::from(format_last_run(entry, now)),
+                Cell::from(entry.next_label.clone()),
             ]));
             row_index += 1;
         }
@@ -292,7 +405,7 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 
     if rows.is_empty() {
         rows.push(Row::new(vec![
-            Cell::from("no jobs"),
+            Cell::from("no jobs or services"),
             Cell::from(""),
             Cell::from(""),
             Cell::from(""),
@@ -311,10 +424,14 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         ],
     )
     .header(
-        Row::new(["Job", "Status", "Trigger", "Last Run", "Next Run"])
+        Row::new(["Name", "Status", "Trigger", "Last Run", "Next"])
             .style(Style::default().add_modifier(Modifier::BOLD)),
     )
-    .block(Block::default().title("Jobs").borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title("Jobs and Services")
+            .borders(Borders::ALL),
+    )
     .row_highlight_style(
         Style::default()
             .bg(Color::DarkGray)
@@ -342,15 +459,39 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect) {
-    let keys = "arrows/j/k select  Enter log  h history  s schedule  r run  T term  K kill  R reload  Backspace clear  q quit";
+    let keys = "arrows/j/k select  Enter log  h history  s schedule  r run/start  T term/stop  K kill  R reload  Backspace clear  q quit";
     frame.render_widget(
         Paragraph::new(keys).block(Block::default().title("Keys").borders(Borders::ALL)),
         area,
     );
 }
 
-fn compact_status(job: &service::JobStatusResponse) -> String {
-    let mut parts = vec![match high_level_status(job) {
+fn group_entries(entries: &[UiEntry]) -> Vec<(Option<String>, Vec<(usize, &UiEntry)>)> {
+    let mut groups: Vec<(Option<String>, Vec<(usize, &UiEntry)>)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let group = entry.group.clone();
+        if let Some((_, group_entries)) = groups.iter_mut().find(|(existing, _)| *existing == group)
+        {
+            group_entries.push((index, entry));
+        } else {
+            groups.push((group, vec![(index, entry)]));
+        }
+    }
+    groups
+}
+
+fn high_level_status(entry: &UiEntry) -> &'static str {
+    match &entry.status {
+        state::JobStatus::Running => "running",
+        state::JobStatus::Failed | state::JobStatus::StartFailed => "last run failed",
+        state::JobStatus::Succeeded => "last run succeeded",
+        state::JobStatus::Interrupted => "last run interrupted",
+        state::JobStatus::Idle => "never run",
+    }
+}
+
+fn compact_status(entry: &UiEntry) -> String {
+    let mut parts = vec![match high_level_status(entry) {
         "last run succeeded" => "ok".to_string(),
         "last run failed" => "failed".to_string(),
         "last run interrupted" => "interrupted".to_string(),
@@ -358,32 +499,41 @@ fn compact_status(job: &service::JobStatusResponse) -> String {
         status => status.to_string(),
     }];
 
-    if job.manual_pending {
+    if entry.manual_pending {
         parts.push("queued".to_string());
     }
-    if matches!(job.status, state::JobStatus::Running) {
+    if matches!(entry.status, state::JobStatus::Running) {
         parts.push(
-            job.pid
+            entry
+                .pid
                 .map(|pid| format!("pid {pid}"))
                 .unwrap_or_else(|| "pid ?".to_string()),
         );
     }
-    if let Some(exit_code) = job.exit_code {
+    if let Some(exit_code) = entry.exit_code {
         parts.push(format!("exit {exit_code}"));
     }
-    if let Some(signal) = &job.terminated_by_signal {
+    if let Some(signal) = &entry.terminated_by_signal {
         parts.push(format!("signal {signal}"));
+    }
+    if entry.last_error.is_some()
+        && !matches!(
+            entry.status,
+            state::JobStatus::Failed | state::JobStatus::StartFailed
+        )
+    {
+        parts.push("warning".to_string());
     }
 
     parts.join(" ")
 }
 
-fn status_cell(job: &service::JobStatusResponse) -> Cell<'static> {
-    Cell::from(compact_status(job)).style(status_style(job))
+fn status_cell(entry: &UiEntry) -> Cell<'static> {
+    Cell::from(compact_status(entry)).style(status_style(entry))
 }
 
-fn status_style(job: &service::JobStatusResponse) -> Style {
-    match job.status {
+fn status_style(entry: &UiEntry) -> Style {
+    match entry.status {
         state::JobStatus::Succeeded => Style::default().fg(Color::Green),
         state::JobStatus::Failed | state::JobStatus::StartFailed => Style::default().fg(Color::Red),
         state::JobStatus::Running => Style::default().fg(Color::Yellow),
@@ -392,35 +542,73 @@ fn status_style(job: &service::JobStatusResponse) -> Style {
     }
 }
 
-fn compact_trigger(job: &service::JobStatusResponse) -> String {
-    match job.trigger.after.as_deref() {
-        Some(upstream) => format!("after {upstream}"),
-        None => job.trigger.kind.clone(),
+fn format_last_run(entry: &UiEntry, now: chrono::DateTime<Local>) -> String {
+    if matches!(entry.status, state::JobStatus::Running) {
+        let Some(started) = entry.started_at else {
+            return "never".to_string();
+        };
+        let elapsed = format_chrono_duration(now.signed_duration_since(started));
+        return format!("{} (running for {elapsed})", format_timestamp(started));
+    }
+
+    let Some(time) = entry.finished_at.or(entry.started_at) else {
+        return "never".to_string();
+    };
+    let ago = format_chrono_duration(now.signed_duration_since(time));
+
+    match (entry.started_at, entry.finished_at) {
+        (Some(started), Some(finished)) => {
+            let took = format_chrono_duration(finished.signed_duration_since(started));
+            format!("{} ({ago} ago, took {took})", format_timestamp(time))
+        }
+        _ => format!("{} ({ago} ago)", format_timestamp(time)),
     }
 }
 
-fn render_schedule(job: &service::JobStatusResponse) -> String {
-    if job.trigger.kind == "manual" {
-        return format!("trigger: {} is manual", job.name);
+fn format_timestamp(time: chrono::DateTime<Local>) -> String {
+    time.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+fn format_time_with_delta(time: chrono::DateTime<Local>, now: chrono::DateTime<Local>) -> String {
+    format!(
+        "{} (in {})",
+        format_timestamp(time),
+        format_chrono_duration(time.signed_duration_since(now))
+    )
+}
+
+fn format_chrono_duration(duration: chrono::Duration) -> String {
+    let milliseconds = duration.num_milliseconds().max(0);
+    format_duration_ms(milliseconds)
+}
+
+fn render_schedule(entry: &UiEntry) -> String {
+    if entry.kind == EntryKind::Service {
+        let mut output = format!("schedule: {} is {}", entry.name, entry.trigger_label);
+        if let Some(start) = entry.next_start {
+            output.push_str(&format!("\nnext start: {}", format_timestamp(start)));
+        }
+        if let Some(stop) = entry.next_stop {
+            output.push_str(&format!("\nnext stop: {}", format_timestamp(stop)));
+        }
+        return output;
     }
-    if job.trigger.kind == "dependency" {
-        return job
-            .trigger
-            .after
-            .as_deref()
-            .map(|upstream| format!("trigger: {} runs after {upstream}", job.name))
-            .unwrap_or_else(|| format!("trigger: {} runs after an unknown job", job.name));
+    if entry.trigger_label == "manual" {
+        return format!("trigger: {} is manual", entry.name);
     }
-    if job.next_runs.is_empty() {
-        return format!("schedule: no upcoming runs found for {}", job.name);
+    if entry.trigger_label.starts_with("after ") {
+        return format!("trigger: {} runs {}", entry.name, entry.trigger_label);
+    }
+    if entry.next_runs.is_empty() {
+        return format!("schedule: no upcoming runs found for {}", entry.name);
     }
 
     let mut output = format!(
         "schedule: next {} run(s) for {}",
-        job.next_runs.len(),
-        job.name
+        entry.next_runs.len(),
+        entry.name
     );
-    for (index, run) in job.next_runs.iter().enumerate() {
+    for (index, run) in entry.next_runs.iter().enumerate() {
         output.push_str(&format!(
             "\n{:>2}. {}",
             index + 1,
@@ -430,13 +618,14 @@ fn render_schedule(job: &service::JobStatusResponse) -> String {
     output
 }
 
-async fn read_recent_log(config: &SundialdConfig, job_uuid: uuid::Uuid) -> String {
-    let encoded_job_id = encode_path_segment(&job_uuid.to_string());
+async fn read_recent_log(config: &SundialdConfig, kind: EntryKind, uuid: uuid::Uuid) -> String {
+    let encoded_id = encode_path_segment(&uuid.to_string());
+    let path = match kind {
+        EntryKind::Job => format!("/jobs/{encoded_id}/logs/latest?tail=40"),
+        EntryKind::Service => format!("/services/{encoded_id}/logs/latest?tail=40"),
+    };
     let response = reqwest::Client::new()
-        .get(format!(
-            "{}/jobs/{encoded_job_id}/logs/latest?tail=40",
-            api_base(config)
-        ))
+        .get(format!("{}{}", api_base(config), path))
         .send()
         .await;
     match response {
@@ -624,8 +813,8 @@ mod tests {
     use chrono::TimeZone;
     use uuid::Uuid;
 
-    fn job_response() -> service::JobStatusResponse {
-        service::JobStatusResponse {
+    fn job_entry() -> UiEntry {
+        UiEntry::from_job(service::JobStatusResponse {
             uuid: Uuid::new_v4(),
             name: "example".to_string(),
             group: None,
@@ -644,12 +833,12 @@ mod tests {
                 after: None,
             },
             manual_pending: false,
-        }
+        })
     }
 
     #[test]
     fn render_schedule_lists_next_runs_for_selected_job() {
-        let mut job = job_response();
+        let mut job = job_entry();
         job.next_runs = vec![
             chrono::Local.with_ymd_and_hms(2026, 1, 1, 3, 0, 0).unwrap(),
             chrono::Local.with_ymd_and_hms(2026, 1, 2, 3, 0, 0).unwrap(),
@@ -664,8 +853,8 @@ mod tests {
 
     #[test]
     fn render_schedule_reports_manual_trigger_jobs() {
-        let mut job = job_response();
-        job.trigger.kind = "manual".to_string();
+        let mut job = job_entry();
+        job.trigger_label = "manual".to_string();
 
         assert_eq!(render_schedule(&job), "trigger: example is manual");
     }
@@ -690,18 +879,17 @@ mod tests {
 
     #[test]
     fn compact_trigger_reports_dependency_target() {
-        let mut job = job_response();
-        job.trigger.kind = "dependency".to_string();
-        job.trigger.after = Some("build".to_string());
+        let mut job = job_entry();
+        job.trigger_label = "after build".to_string();
 
-        assert_eq!(compact_trigger(&job), "after build");
+        assert_eq!(render_schedule(&job), "trigger: example runs after build");
     }
 
     #[test]
     fn status_cell_colors_success_and_failure() {
-        let mut success = job_response();
+        let mut success = job_entry();
         success.status = crate::state::JobStatus::Succeeded;
-        let mut failed = job_response();
+        let mut failed = job_entry();
         failed.status = crate::state::JobStatus::Failed;
 
         assert_eq!(status_style(&success).fg, Some(Color::Green));
@@ -710,14 +898,14 @@ mod tests {
 
     #[test]
     fn grouping_preserves_job_order_and_group_labels() {
-        let mut first = job_response();
+        let mut first = job_entry();
         first.name = "inline".to_string();
-        let mut second = job_response();
+        let mut second = job_entry();
         second.name = "cleanup".to_string();
         second.group = Some("maintenance".to_string());
-        let jobs = vec![first, second];
+        let entries = vec![first, second];
 
-        let groups = group_jobs(&jobs);
+        let groups = group_entries(&entries);
 
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].0, None);

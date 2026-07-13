@@ -23,10 +23,11 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use super::ServiceCommand;
 use super::history::{HistoryDb, RunHistoryEntry};
 use super::process::{JobControl, SignalKind};
 use crate::{
-    config::{JobTrigger, SundialdConfig},
+    config::{JobTrigger, ServiceSchedule, SundialdConfig},
     state::{JobStatus, StateSnapshot},
 };
 
@@ -38,6 +39,7 @@ pub(crate) struct ApiState {
     pub(crate) state: Arc<Mutex<StateSnapshot>>,
     pub(crate) pending_manual: Arc<Mutex<HashSet<String>>>,
     pub(crate) manual_tx: mpsc::UnboundedSender<String>,
+    pub(crate) service_tx: mpsc::UnboundedSender<ServiceCommand>,
     pub(crate) running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
     pub(crate) history: HistoryDb,
 }
@@ -46,6 +48,7 @@ pub(crate) struct ApiState {
 pub struct StatusResponse {
     pub updated_at: DateTime<Local>,
     pub jobs: Vec<JobStatusResponse>,
+    pub services: Vec<ServiceStatusResponse>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -74,6 +77,24 @@ pub struct TriggerStatusResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ServiceStatusResponse {
+    pub uuid: Uuid,
+    pub name: String,
+    pub group: Option<String>,
+    pub status: JobStatus,
+    pub pid: Option<u32>,
+    pub started_at: Option<DateTime<Local>>,
+    pub finished_at: Option<DateTime<Local>>,
+    pub exit_code: Option<i32>,
+    pub log_path: Option<PathBuf>,
+    pub last_error: Option<String>,
+    pub terminated_by_signal: Option<String>,
+    pub schedule: String,
+    pub next_start: Option<DateTime<Local>>,
+    pub next_stop: Option<DateTime<Local>>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct RunResponse {
     pub job: String,
     pub queued: bool,
@@ -87,9 +108,17 @@ pub struct TerminateResponse {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ServiceControlResponse {
+    pub service: String,
+    pub queued: bool,
+    pub action: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReloadResponse {
     pub reloaded: bool,
     pub jobs: usize,
+    pub services: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -131,6 +160,10 @@ async fn run_api_on_listener(listener: TcpListener, state: ApiState) -> Result<(
         .route("/jobs/{job}/kill", post(api_kill_job))
         .route("/jobs/{job}/history", get(api_job_history))
         .route("/jobs/{job}/logs/latest", get(api_latest_log))
+        .route("/services/{service}/start", post(api_start_service))
+        .route("/services/{service}/stop", post(api_stop_service))
+        .route("/services/{service}/kill", post(api_kill_service))
+        .route("/services/{service}/logs/latest", get(api_latest_log))
         .route("/reload", post(api_reload))
         .with_state(state);
     axum::serve(listener, app)
@@ -164,6 +197,7 @@ async fn api_reload(State(api): State<ApiState>) -> Response {
             };
             new_config.absolutize_runtime_paths(&runtime_base);
             let job_count = new_config.jobs.len();
+            let service_count = new_config.services.len();
             let _ = fs::create_dir_all(&new_config.state_dir).await;
             let _ = fs::create_dir_all(&new_config.log_dir).await;
             let _ = fs::create_dir_all(&new_config.alert.event_dir).await;
@@ -177,6 +211,7 @@ async fn api_reload(State(api): State<ApiState>) -> Response {
                 Json(ReloadResponse {
                     reloaded: true,
                     jobs: job_count,
+                    services: service_count,
                 }),
             )
                 .into_response()
@@ -228,6 +263,27 @@ async fn api_kill_job(State(api): State<ApiState>, AxumPath(job): AxumPath<Strin
     api_signal_job(api, job, SignalKind::Kill).await
 }
 
+async fn api_start_service(
+    State(api): State<ApiState>,
+    AxumPath(service): AxumPath<String>,
+) -> Response {
+    api_control_service(api, service, ServiceAction::Start).await
+}
+
+async fn api_stop_service(
+    State(api): State<ApiState>,
+    AxumPath(service): AxumPath<String>,
+) -> Response {
+    api_control_service(api, service, ServiceAction::Stop).await
+}
+
+async fn api_kill_service(
+    State(api): State<ApiState>,
+    AxumPath(service): AxumPath<String>,
+) -> Response {
+    api_control_service(api, service, ServiceAction::Kill).await
+}
+
 async fn api_job_history(
     State(api): State<ApiState>,
     AxumPath(job): AxumPath<String>,
@@ -264,10 +320,10 @@ async fn api_latest_log(
     AxumPath(job): AxumPath<String>,
     Query(query): Query<LimitQuery>,
 ) -> Response {
-    let Some(uuid) = resolve_job_id(&api, &job).await else {
+    let Some(uuid) = resolve_runnable_id(&api, &job).await else {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("unknown job '{job}'") })),
+            Json(json!({ "error": format!("unknown job or service '{job}'") })),
         )
             .into_response();
     };
@@ -296,7 +352,7 @@ async fn api_latest_log(
     let Some(log_path) = log_path else {
         return (
             StatusCode::NOT_FOUND,
-            Json(json!({ "error": format!("job '{job}' has no log file") })),
+            Json(json!({ "error": format!("job or service '{job}' has no log file") })),
         )
             .into_response();
     };
@@ -329,7 +385,7 @@ async fn api_latest_log(
             (
                 StatusCode::OK,
                 Json(LogResponse {
-                    job: resolve_job_label(&api, uuid).await,
+                    job: resolve_runnable_label(&api, uuid).await,
                     uuid,
                     log_path,
                     stderr_log_path,
@@ -402,6 +458,58 @@ async fn resolve_job_id(api: &ApiState, job_name: &str) -> Option<Uuid> {
         .map(|state| state.uuid)
 }
 
+async fn resolve_service_id(api: &ApiState, service_name: &str) -> Option<Uuid> {
+    if let Ok(uuid) = Uuid::parse_str(service_name) {
+        let config_has_id = api
+            .config
+            .read()
+            .await
+            .services
+            .iter()
+            .any(|candidate| candidate.uuid == Some(uuid));
+        if config_has_id {
+            return Some(uuid);
+        }
+        let state_has_running_id = api
+            .state
+            .lock()
+            .await
+            .jobs
+            .iter()
+            .any(|state| state.uuid == uuid && state.status.is_running());
+        if state_has_running_id {
+            return Some(uuid);
+        }
+    }
+
+    let id_from_config = api
+        .config
+        .read()
+        .await
+        .services
+        .iter()
+        .find(|candidate| candidate.name == service_name)
+        .and_then(|candidate| candidate.uuid);
+    if id_from_config.is_some() {
+        return id_from_config;
+    }
+
+    api.state
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .find(|state| state.name == service_name && state.status.is_running())
+        .map(|state| state.uuid)
+}
+
+async fn resolve_runnable_id(api: &ApiState, name: &str) -> Option<Uuid> {
+    if let Some(uuid) = resolve_job_id(api, name).await {
+        return Some(uuid);
+    }
+    resolve_service_id(api, name).await
+}
+
 async fn resolve_job_label(api: &ApiState, uuid: Uuid) -> String {
     if let Some(name) = api
         .config
@@ -414,6 +522,59 @@ async fn resolve_job_label(api: &ApiState, uuid: Uuid) -> String {
     {
         return name;
     }
+
+    api.state
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .find(|state| state.uuid == uuid)
+        .map(|state| state.name.clone())
+        .unwrap_or_else(|| uuid.to_string())
+}
+
+async fn resolve_service_label(api: &ApiState, uuid: Uuid) -> String {
+    if let Some(name) = api
+        .config
+        .read()
+        .await
+        .services
+        .iter()
+        .find(|service| service.uuid == Some(uuid))
+        .map(|service| service.name.clone())
+    {
+        return name;
+    }
+
+    api.state
+        .lock()
+        .await
+        .jobs
+        .iter()
+        .find(|state| state.uuid == uuid)
+        .map(|state| state.name.clone())
+        .unwrap_or_else(|| uuid.to_string())
+}
+
+async fn resolve_runnable_label(api: &ApiState, uuid: Uuid) -> String {
+    let config = api.config.read().await;
+    if let Some(name) = config
+        .jobs
+        .iter()
+        .find(|job| job.uuid == Some(uuid))
+        .map(|job| job.name.clone())
+    {
+        return name;
+    }
+    if let Some(name) = config
+        .services
+        .iter()
+        .find(|service| service.uuid == Some(uuid))
+        .map(|service| service.name.clone())
+    {
+        return name;
+    }
+    drop(config);
 
     api.state
         .lock()
@@ -447,7 +608,13 @@ async fn api_signal_job(api: ApiState, job: String, signal: SignalKind) -> Respo
             .into_response();
     };
 
-    if control.send(JobControl::Signal(signal)).is_err() {
+    if control
+        .send(JobControl::Signal {
+            kind: signal,
+            expected: false,
+        })
+        .is_err()
+    {
         return (
             StatusCode::CONFLICT,
             Json(json!({ "error": format!("job '{job}' is no longer running") })),
@@ -461,6 +628,64 @@ async fn api_signal_job(api: ApiState, job: String, signal: SignalKind) -> Respo
             job,
             signaled: true,
             signal: signal.name().to_string(),
+        }),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ServiceAction {
+    Start,
+    Stop,
+    Kill,
+}
+
+impl ServiceAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Start => "start",
+            Self::Stop => "stop",
+            Self::Kill => "kill",
+        }
+    }
+
+    fn command(self, service: String) -> ServiceCommand {
+        match self {
+            Self::Start => ServiceCommand::Start(service),
+            Self::Stop => ServiceCommand::Stop(service),
+            Self::Kill => ServiceCommand::Kill(service),
+        }
+    }
+}
+
+async fn api_control_service(api: ApiState, service: String, action: ServiceAction) -> Response {
+    let Some(uuid) = resolve_service_id(&api, &service).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown service '{service}'") })),
+        )
+            .into_response();
+    };
+    let service_name = resolve_service_label(&api, uuid).await;
+
+    if api
+        .service_tx
+        .send(action.command(service_name.clone()))
+        .is_err()
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "service is not accepting service control requests" })),
+        )
+            .into_response();
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        Json(ServiceControlResponse {
+            service: service_name,
+            queued: true,
+            action: action.label().to_string(),
         }),
     )
         .into_response()
@@ -608,9 +833,58 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
         });
     }
 
+    let mut services: Vec<ServiceStatusResponse> = config
+        .services
+        .iter()
+        .map(|service| {
+            let uuid = service
+                .uuid
+                .expect("service uuid must be assigned before serving status");
+            let state = by_id.get(&uuid);
+            let (schedule, next_start, next_stop) = match &service.schedule {
+                ServiceSchedule::Permanent => ("permanent".to_string(), None, None),
+                ServiceSchedule::Window { start, stop } => {
+                    let start_runs = start.next_runs(now, 1);
+                    let stop_runs = stop.next_runs(now, 1);
+                    (
+                        "window".to_string(),
+                        start_runs.first().copied(),
+                        stop_runs.first().copied(),
+                    )
+                }
+            };
+            ServiceStatusResponse {
+                uuid,
+                name: service.name.clone(),
+                group: service.group.clone(),
+                status: state
+                    .map(|state| state.status.clone())
+                    .unwrap_or(JobStatus::Idle),
+                pid: state.and_then(|state| state.pid),
+                started_at: state.and_then(|state| state.started_at),
+                finished_at: state.and_then(|state| state.finished_at),
+                exit_code: state.and_then(|state| state.exit_code),
+                log_path: state
+                    .and_then(|state| state.log_path.clone())
+                    .map(|path| resolve_log_path(&config.log_dir, &runtime_base, &path)),
+                last_error: state.and_then(|state| state.last_error.clone()),
+                terminated_by_signal: state.and_then(|state| state.terminated_by_signal.clone()),
+                schedule,
+                next_start,
+                next_stop,
+            }
+        })
+        .collect();
+    services.sort_by(|left, right| {
+        left.group
+            .cmp(&right.group)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+
     StatusResponse {
         updated_at: Local::now(),
         jobs,
+        services,
     }
 }
 
@@ -669,7 +943,7 @@ fn tail_lines(content: &str, max_lines: usize) -> Option<String> {
 mod tests {
     use super::*;
     use crate::{
-        config::{AlertConfig, JobConfig, JobTrigger, Schedule},
+        config::{AlertConfig, JobConfig, JobTrigger, Schedule, ServiceConfig, ServiceSchedule},
         service::history::HistoryDb,
         state::JobState,
     };
@@ -701,11 +975,26 @@ mod tests {
                 env: HashMap::new(),
                 source_path: None,
             }],
+            services: Vec::new(),
+        }
+    }
+
+    fn test_service(name: &str) -> ServiceConfig {
+        ServiceConfig {
+            uuid: Some(Uuid::new_v4()),
+            name: name.to_string(),
+            command: "sleep 60".to_string(),
+            schedule: ServiceSchedule::Permanent,
+            stop_grace_period: Some("5s".to_string()),
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
         }
     }
 
     fn test_api(config: SundialdConfig, snapshot: StateSnapshot) -> ApiState {
         let (manual_tx, _manual_rx) = mpsc::unbounded_channel();
+        let (service_tx, _service_rx) = mpsc::unbounded_channel();
         let history = HistoryDb::test_at(config.state_dir.join("history.sqlite3"));
         ApiState {
             config: Arc::new(RwLock::new(config)),
@@ -713,6 +1002,7 @@ mod tests {
             state: Arc::new(Mutex::new(snapshot)),
             pending_manual: Arc::new(Mutex::new(HashSet::new())),
             manual_tx,
+            service_tx,
             running_controls: Arc::new(Mutex::new(HashMap::new())),
             history,
         }
@@ -723,6 +1013,16 @@ mod tests {
         snapshot: StateSnapshot,
         manual_tx: mpsc::UnboundedSender<String>,
     ) -> ApiState {
+        let (service_tx, _service_rx) = mpsc::unbounded_channel();
+        test_api_with_senders(config, snapshot, manual_tx, service_tx)
+    }
+
+    fn test_api_with_senders(
+        config: SundialdConfig,
+        snapshot: StateSnapshot,
+        manual_tx: mpsc::UnboundedSender<String>,
+        service_tx: mpsc::UnboundedSender<ServiceCommand>,
+    ) -> ApiState {
         let history = HistoryDb::test_at(config.state_dir.join("history.sqlite3"));
         ApiState {
             config: Arc::new(RwLock::new(config)),
@@ -730,6 +1030,7 @@ mod tests {
             state: Arc::new(Mutex::new(snapshot)),
             pending_manual: Arc::new(Mutex::new(HashSet::new())),
             manual_tx,
+            service_tx,
             running_controls: Arc::new(Mutex::new(HashMap::new())),
             history,
         }
@@ -845,6 +1146,54 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(manual_rx.recv().await.unwrap(), "sleepy");
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn api_exposes_service_status_and_start_endpoint() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path().to_path_buf());
+        let job_id = config.jobs[0].uuid.unwrap();
+        let service = test_service("worker");
+        let service_id = service.uuid.unwrap();
+        config.services.push(service);
+        let snapshot = StateSnapshot::new(vec![
+            (job_id, "sleepy".to_string()),
+            (service_id, "worker".to_string()),
+        ]);
+        let (manual_tx, _manual_rx) = mpsc::unbounded_channel();
+        let (service_tx, mut service_rx) = mpsc::unbounded_channel();
+        let api = test_api_with_senders(config, snapshot, manual_tx, service_tx);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_api_on_listener(listener, api));
+
+        let status: StatusResponse = reqwest::Client::new()
+            .get(format!("http://{addr}/status"))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(status.services.len(), 1);
+        assert_eq!(status.services[0].name, "worker");
+        assert_eq!(status.services[0].schedule, "permanent");
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/services/{service_id}/start"))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert!(matches!(
+            service_rx.recv().await.unwrap(),
+            ServiceCommand::Start(service) if service == "worker"
+        ));
         handle.abort();
     }
 
@@ -1009,7 +1358,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(matches!(
             control_rx.recv().await.unwrap(),
-            JobControl::Signal(SignalKind::Kill)
+            JobControl::Signal {
+                kind: SignalKind::Kill,
+                expected: false
+            }
         ));
         handle.abort();
     }
@@ -1060,7 +1412,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(matches!(
             control_rx.recv().await.unwrap(),
-            JobControl::Signal(SignalKind::Term)
+            JobControl::Signal {
+                kind: SignalKind::Term,
+                expected: false
+            }
         ));
 
         handle.abort();
@@ -1109,7 +1464,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert!(matches!(
             control_rx.recv().await.unwrap(),
-            JobControl::Signal(SignalKind::Term)
+            JobControl::Signal {
+                kind: SignalKind::Term,
+                expected: false
+            }
         ));
 
         handle.abort();

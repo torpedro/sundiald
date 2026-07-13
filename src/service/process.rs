@@ -19,13 +19,13 @@ use uuid::Uuid;
 
 use super::{alert::write_alert, history::HistoryDb};
 use crate::{
-    config::{AlertConfig, JobConfig},
+    config::{AlertConfig, JobConfig, ServiceConfig},
     state::{JobState, JobStatus, StateSnapshot},
 };
 
 #[derive(Debug)]
 pub(crate) enum JobControl {
-    Signal(SignalKind),
+    Signal { kind: SignalKind, expected: bool },
 }
 
 #[derive(Debug, Clone)]
@@ -33,6 +33,8 @@ pub(crate) enum RunTrigger {
     Schedule,
     Dependency { upstream: String },
     Manual,
+    ServiceSchedule,
+    ServiceManual,
 }
 
 impl RunTrigger {
@@ -41,6 +43,8 @@ impl RunTrigger {
             Self::Schedule => "schedule",
             Self::Dependency { .. } => "dependency",
             Self::Manual => "manual",
+            Self::ServiceSchedule => "service_schedule",
+            Self::ServiceManual => "service_manual",
         }
     }
 
@@ -49,8 +53,16 @@ impl RunTrigger {
             Self::Schedule => String::new(),
             Self::Dependency { upstream } => format!(" trigger=dependency upstream={upstream}"),
             Self::Manual => " trigger=manual".to_string(),
+            Self::ServiceSchedule => " trigger=service_schedule".to_string(),
+            Self::ServiceManual => " trigger=service_manual".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProcessKind {
+    Job,
+    Service,
 }
 
 #[derive(Debug, Clone)]
@@ -121,9 +133,53 @@ pub(crate) fn spawn_tracked_job(
             control_rx,
             emit_stdout,
             trigger,
+            ProcessKind::Job,
         )
         .await;
         let _ = completion_tx.send(completion);
+        running_controls.lock().await.remove(&uuid);
+    });
+
+    RunningJob { handle, control_tx }
+}
+
+pub(crate) fn spawn_tracked_service(
+    service: ServiceConfig,
+    log_dir: PathBuf,
+    service_log: PathBuf,
+    alert: AlertConfig,
+    state_dir: PathBuf,
+    history: HistoryDb,
+    state: Arc<Mutex<StateSnapshot>>,
+    running_controls: Arc<Mutex<HashMap<Uuid, mpsc::UnboundedSender<JobControl>>>>,
+    emit_stdout: bool,
+    trigger: RunTrigger,
+) -> RunningJob {
+    let uuid = service
+        .uuid
+        .expect("service uuid must be assigned before scheduling (see load_and_ensure_ids)");
+    let job = service.as_job_config();
+    let (control_tx, control_rx) = mpsc::unbounded_channel();
+    let handle_control_tx = control_tx.clone();
+    let handle = tokio::spawn(async move {
+        running_controls
+            .lock()
+            .await
+            .insert(uuid, handle_control_tx);
+        let _ = run_job(
+            job,
+            log_dir,
+            service_log,
+            alert,
+            state_dir,
+            history,
+            state,
+            control_rx,
+            emit_stdout,
+            trigger,
+            ProcessKind::Service,
+        )
+        .await;
         running_controls.lock().await.remove(&uuid);
     });
 
@@ -141,6 +197,7 @@ async fn run_job(
     control_rx: mpsc::UnboundedReceiver<JobControl>,
     emit_stdout: bool,
     trigger: RunTrigger,
+    process_kind: ProcessKind,
 ) -> JobCompletion {
     match run_job_inner(
         job.clone(),
@@ -153,6 +210,7 @@ async fn run_job(
         control_rx,
         emit_stdout,
         trigger,
+        process_kind,
     )
     .await
     {
@@ -227,6 +285,7 @@ async fn run_job_inner(
     mut control_rx: mpsc::UnboundedReceiver<JobControl>,
     emit_stdout: bool,
     trigger: RunTrigger,
+    process_kind: ProcessKind,
 ) -> Result<JobCompletion> {
     let uuid = job
         .uuid
@@ -358,6 +417,7 @@ async fn run_job_inner(
     let alert_threshold = job.alert_threshold();
     let mut overrun_alerted = false;
     let mut terminated_by = None;
+    let mut expected_stop = false;
     let status = loop {
         let overrun_sleep = async {
             match alert_threshold {
@@ -369,8 +429,9 @@ async fn run_job_inner(
         tokio::select! {
             status = child.wait() => break status?,
             command = control_rx.recv() => {
-                if let Some(JobControl::Signal(signal)) = command {
+                if let Some(JobControl::Signal { kind: signal, expected }) = command {
                     terminated_by = Some(signal);
+                    expected_stop = expected;
                     if let Some(pid) = pid {
                         send_signal(pid, signal)?;
                         super::log_service_event(
@@ -412,14 +473,24 @@ async fn run_job_inner(
     let finished_at = Local::now();
     let exit_code = status.code();
     let success = status.success();
-    let status_kind = if success {
+    let unexpected_service_exit = matches!(process_kind, ProcessKind::Service) && !expected_stop;
+    let expected_service_stop = matches!(process_kind, ProcessKind::Service) && expected_stop;
+    let status_kind = if expected_service_stop {
+        JobStatus::Succeeded
+    } else if unexpected_service_exit {
+        JobStatus::Failed
+    } else if success {
         JobStatus::Succeeded
     } else {
         JobStatus::Failed
     };
     let history_status = status_kind.to_string();
     let history_signal = terminated_by.map(|signal| signal.name());
-    let last_error = if success {
+    let last_error = if expected_service_stop {
+        None
+    } else if unexpected_service_exit && success {
+        Some("service exited unexpectedly".to_string())
+    } else if success {
         None
     } else if let Some(signal) = history_signal {
         Some(format!("terminated by {signal}"))
@@ -593,6 +664,7 @@ mod tests {
             control_rx,
             false,
             RunTrigger::Manual,
+            ProcessKind::Job,
         )
         .await
         .unwrap();
@@ -647,6 +719,7 @@ mod tests {
             control_rx,
             false,
             RunTrigger::Manual,
+            ProcessKind::Job,
         )
         .await
         .unwrap();
@@ -712,6 +785,7 @@ mod tests {
             control_rx,
             false,
             RunTrigger::Manual,
+            ProcessKind::Job,
         )
         .await
         .unwrap();
@@ -766,6 +840,7 @@ mod tests {
             control_rx,
             false,
             RunTrigger::Manual,
+            ProcessKind::Job,
         )
         .await
         .unwrap();
@@ -793,5 +868,124 @@ mod tests {
             tokio::fs::read_to_string(stderr_path).await.unwrap(),
             "err\n"
         );
+    }
+
+    #[tokio::test]
+    async fn service_exit_with_zero_status_is_failed_and_alerted_when_unexpected() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "service".to_string(),
+            command: "true".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+
+        run_job_inner(
+            job,
+            temp.path().join("logs"),
+            temp.path().join("sundiald.log"),
+            alert.clone(),
+            temp.path().to_path_buf(),
+            history,
+            Arc::clone(&state),
+            control_rx,
+            false,
+            RunTrigger::ServiceManual,
+            ProcessKind::Service,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = state.lock().await;
+        let service_state = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.uuid == job_id)
+            .expect("service state should be persisted");
+        assert!(matches!(service_state.status, JobStatus::Failed));
+        assert_eq!(
+            service_state.last_error.as_deref(),
+            Some("service exited unexpectedly")
+        );
+        let mut entries = tokio::fs::read_dir(&alert.event_dir).await.unwrap();
+        assert!(entries.next_entry().await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn expected_service_sigterm_records_success_without_alerting() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "service-stop".to_string(),
+            command: "sleep 5".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = control_tx.send(JobControl::Signal {
+                kind: SignalKind::Term,
+                expected: true,
+            });
+        });
+
+        run_job_inner(
+            job,
+            temp.path().join("logs"),
+            temp.path().join("sundiald.log"),
+            alert.clone(),
+            temp.path().to_path_buf(),
+            history,
+            Arc::clone(&state),
+            control_rx,
+            false,
+            RunTrigger::ServiceManual,
+            ProcessKind::Service,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = state.lock().await;
+        let service_state = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.uuid == job_id)
+            .expect("service state should be persisted");
+        assert!(matches!(service_state.status, JobStatus::Succeeded));
+        assert!(service_state.last_error.is_none());
+        assert_eq!(
+            service_state.terminated_by_signal.as_deref(),
+            Some("SIGTERM")
+        );
+        assert!(!alert.event_dir.exists());
     }
 }

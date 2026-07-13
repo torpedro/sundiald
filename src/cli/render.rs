@@ -62,12 +62,31 @@ pub(crate) async fn render_status(
     if let Some(last_command) = last_command {
         output.push('\n');
         output.push_str(
-            "keys: arrows/j/k select, Enter log, h history, s schedule, r run now, T SIGTERM, K SIGKILL, R reload config, Backspace clear, q quit",
+            "keys: arrows/j/k select, Enter log, h history, s schedule, r run/start, T SIGTERM/stop, K SIGKILL, R reload config, Backspace clear, q quit",
         );
         output.push('\n');
         if !last_command.is_empty() {
             output.push_str(last_command);
             output.push('\n');
+        }
+    }
+
+    if !status.services.is_empty() {
+        if !output.is_empty() {
+            output.push_str("----\n");
+        }
+        output.push_str(&format!("{}\n", "services".bold()));
+        for service in &status.services {
+            output.push_str(&format!("{}\n", service.name));
+            output.push_str(&format!("  status: {}\n", colored_service_status(service)));
+            output.push_str(&format!(
+                "  last_run: {}\n",
+                format_service_last_run(service, now)
+            ));
+            output.push_str(&format!(
+                "  next: {}\n",
+                format_service_next_run(service, now)
+            ));
         }
     }
 
@@ -139,6 +158,27 @@ fn colored_status(job: &service::JobStatusResponse) -> String {
     }
 }
 
+fn colored_service_status(service: &service::ServiceStatusResponse) -> String {
+    let status = match service.status {
+        state::JobStatus::Running => "running".yellow().to_string(),
+        state::JobStatus::Failed | state::JobStatus::StartFailed => {
+            "last run failed".red().to_string()
+        }
+        state::JobStatus::Succeeded => "last run succeeded".green().to_string(),
+        state::JobStatus::Interrupted => "last run interrupted".yellow().to_string(),
+        state::JobStatus::Idle => "never run".to_string(),
+    };
+
+    if matches!(service.status, state::JobStatus::Running) {
+        match service.pid {
+            Some(pid) => format!("{status} pid={pid}"),
+            None => format!("{status} pid=unknown"),
+        }
+    } else {
+        status
+    }
+}
+
 /// Shows when the last run happened plus how long it took: "took X" for a
 /// completed run, "running for X" while still active, or just the "ago"
 /// timestamp with no duration when the run length isn't known (e.g.
@@ -158,6 +198,32 @@ pub(crate) fn format_last_run(job: &service::JobStatusResponse, now: DateTime<Lo
     let ago = format_duration(now.signed_duration_since(time));
 
     match (job.started_at, job.finished_at) {
+        (Some(started), Some(finished)) => {
+            let took = format_duration_precise(finished.signed_duration_since(started));
+            format!("{} ({ago} ago, took {took})", format_timestamp(time))
+        }
+        _ => format!("{} ({ago} ago)", format_timestamp(time)),
+    }
+}
+
+fn format_service_last_run(
+    service: &service::ServiceStatusResponse,
+    now: DateTime<Local>,
+) -> String {
+    if matches!(service.status, state::JobStatus::Running) {
+        let Some(started) = service.started_at else {
+            return "never".to_string();
+        };
+        let elapsed = format_duration_precise(now.signed_duration_since(started));
+        return format!("{} (running for {elapsed})", format_timestamp(started));
+    }
+
+    let Some(time) = service.finished_at.or(service.started_at) else {
+        return "never".to_string();
+    };
+    let ago = format_duration(now.signed_duration_since(time));
+
+    match (service.started_at, service.finished_at) {
         (Some(started), Some(finished)) => {
             let took = format_duration_precise(finished.signed_duration_since(started));
             format!("{} ({ago} ago, took {took})", format_timestamp(time))
@@ -191,32 +257,30 @@ fn format_next_run(job: &service::JobStatusResponse, now: DateTime<Local>) -> St
         .unwrap_or_else(|| "none found".to_string())
 }
 
-pub(crate) fn format_next_run_plain(
-    job: &service::JobStatusResponse,
+fn format_service_next_run(
+    service: &service::ServiceStatusResponse,
     now: DateTime<Local>,
 ) -> String {
-    match job.trigger.kind.as_str() {
-        "manual" => return "manual".to_string(),
-        "dependency" => {
-            return job
-                .trigger
-                .after
-                .as_deref()
-                .map(|upstream| format!("after {upstream}"))
-                .unwrap_or_else(|| "after unknown".to_string());
-        }
-        _ => {}
+    match (service.next_start, service.next_stop) {
+        (Some(start), Some(stop)) => format!(
+            "start {} (in {}) / stop {} (in {})",
+            format_timestamp(start),
+            format_duration(start.signed_duration_since(now)),
+            format_timestamp(stop),
+            format_duration(stop.signed_duration_since(now))
+        ),
+        (Some(start), None) => format!(
+            "start {} (in {})",
+            format_timestamp(start),
+            format_duration(start.signed_duration_since(now))
+        ),
+        (None, Some(stop)) => format!(
+            "stop {} (in {})",
+            format_timestamp(stop),
+            format_duration(stop.signed_duration_since(now))
+        ),
+        (None, None) => service.schedule.clone(),
     }
-
-    job.next_run
-        .map(|time| {
-            format!(
-                "{} (in {})",
-                format_timestamp(time),
-                format_duration(time.signed_duration_since(now))
-            )
-        })
-        .unwrap_or_else(|| "none found".to_string())
 }
 
 fn format_timestamp(time: DateTime<Local>) -> String {

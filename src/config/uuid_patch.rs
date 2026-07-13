@@ -15,8 +15,8 @@ fn parse_dash_name_line(line: &str) -> Option<(&str, String)> {
     Some((indent, value.to_string()))
 }
 
-/// Inserts a `uuid: <uuid>` line right after each job's `- name:` line for
-/// the jobs listed in `missing`, matched by name. This assumes sundiald's own
+/// Inserts a `uuid: <uuid>` line right after each runnable's `- name:` line for
+/// the entries listed in `missing`, matched by name. This assumes sundiald's own
 /// generated/documented indentation style (a 2-space-indented `- name:`
 /// followed by sibling keys indented 2 spaces further); if a name can't be
 /// located, this fails loudly rather than silently writing a partial or
@@ -41,7 +41,7 @@ pub(crate) fn insert_missing_job_uuids(raw: &str, missing: &[(String, Uuid)]) ->
         let mut names: Vec<&str> = remaining.keys().copied().collect();
         names.sort_unstable();
         bail!(
-            "could not locate job(s) {} in the config text to persist their generated uuid; \
+            "could not locate runnable(s) {} in the config text to persist their generated uuid; \
              add `uuid: <uuid>` under each by hand",
             names.join(", ")
         );

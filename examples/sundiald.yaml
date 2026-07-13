@@ -20,11 +20,11 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
-# Environment variables inherited by inline jobs in this file.
+# Environment variables inherited by inline jobs and services in this file.
 env:
   APP_ENV: production
-# Optional named files containing additional job definitions.
-# Each file is a YAML map with optional `env` and a required `jobs` list.
+# Optional named files containing additional job and service definitions.
+# Each file is a YAML map with optional `env`, `jobs`, and `services` lists.
 # job_files:
 #   - name: maintenance
 #     path: maintenance.yaml
@@ -45,3 +45,15 @@ jobs:
     uuid: 14036dee-250c-4625-a3d6-21a068f82a4a
     command: "echo this job fails; exit 42"
     trigger: manual
+services:
+  - name: web
+    uuid: 3e6012cb-d80f-4645-9b1f-15b943b35a83
+    command: "python3 -m http.server 8080"
+    schedule: permanent
+  - name: office-worker
+    uuid: 8bb33865-08a4-47ef-bdbf-028108c99c42
+    command: "bin/worker"
+    stop_grace_period: "45s"
+    schedule:
+      start: "0 0 9 * * mon-fri"
+      stop: "0 0 17 * * mon-fri"

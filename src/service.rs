@@ -39,7 +39,10 @@ use process::{
 };
 
 use crate::{
-    config::{AlertConfig, JobTrigger, ServiceConfig, ServiceSchedule, SundialdConfig},
+    config::{
+        AlertConfig, JobTrigger, MissedRunPolicy, Schedule, ServiceConfig, ServiceSchedule,
+        SundialdConfig,
+    },
     state::StateSnapshot,
 };
 
@@ -52,6 +55,37 @@ pub(crate) enum ServiceCommand {
 
 fn current_second(now: DateTime<Local>) -> DateTime<Local> {
     now.with_nanosecond(0).unwrap_or(now)
+}
+
+fn scheduled_occurrence(
+    schedule: &Schedule,
+    policy: MissedRunPolicy,
+    previous_tick: DateTime<Local>,
+    current_tick: DateTime<Local>,
+) -> Option<DateTime<Local>> {
+    match policy {
+        MissedRunPolicy::Skip => schedule.matches(current_tick).then_some(current_tick),
+        MissedRunPolicy::RunOnce if current_tick > previous_tick => {
+            schedule.latest_between(previous_tick, current_tick)
+        }
+        MissedRunPolicy::RunOnce => schedule.matches(current_tick).then_some(current_tick),
+    }
+}
+
+fn service_occurrences(
+    start: &Schedule,
+    stop: &Schedule,
+    policy: MissedRunPolicy,
+    previous_tick: DateTime<Local>,
+    current_tick: DateTime<Local>,
+) -> (Option<DateTime<Local>>, Option<DateTime<Local>>) {
+    let start_at = scheduled_occurrence(start, policy, previous_tick, current_tick);
+    let stop_at = scheduled_occurrence(stop, policy, previous_tick, current_tick);
+    match (start_at, stop_at) {
+        (Some(start_at), Some(stop_at)) if start_at > stop_at => (Some(start_at), None),
+        (Some(_), Some(stop_at)) => (None, Some(stop_at)),
+        occurrences => occurrences,
+    }
 }
 
 /// Strips a job name down to filesystem-safe characters, for use in log and
@@ -157,6 +191,7 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
     let mut service_grace_alerted: HashSet<Uuid> = HashSet::new();
     let mut tick = time::interval(Duration::from_secs(1));
     let mut cleanup_tick = time::interval(Duration::from_secs(3600));
+    let mut last_scheduler_tick = current_second(Local::now());
 
     eprintln!("sundiald service started with {job_count} job(s)");
     eprintln!("sundiald api listening on http://{api_bind}");
@@ -204,6 +239,8 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
                 retain_running(&mut running_services);
                 let current_config = config.read().await.clone();
                 let second = current_second(Local::now());
+                let previous_tick = last_scheduler_tick;
+                last_scheduler_tick = second;
                 fired_seconds.retain(|(_, fired_at)| *fired_at >= second - chrono::Duration::hours(24));
                 service_fired_seconds.retain(|(_, _, fired_at)| *fired_at >= second - chrono::Duration::hours(24));
                 let configured_service_ids = current_config
@@ -228,10 +265,15 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
                     }
                     match &job.trigger {
                         JobTrigger::Schedule(schedule) => {
-                            if !schedule.matches(second) {
+                            let Some(scheduled_at) = scheduled_occurrence(
+                                schedule,
+                                current_config.missed_run_policy,
+                                previous_tick,
+                                second,
+                            ) else {
                                 continue;
-                            }
-                            if !fired_seconds.insert((uuid, second)) {
+                            };
+                            if !fired_seconds.insert((uuid, scheduled_at)) {
                                 continue;
                             }
                         }
@@ -259,11 +301,20 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
                     let ServiceSchedule::Window { start, stop } = &service.schedule else {
                         continue;
                     };
-                    if stop.matches(second) && service_fired_seconds.insert((uuid, "stop", second)) {
+                    let (start_at, stop_at) = service_occurrences(
+                        start,
+                        stop,
+                        current_config.missed_run_policy,
+                        previous_tick,
+                        second,
+                    );
+                    if let Some(stop_at) = stop_at
+                        && service_fired_seconds.insert((uuid, "stop", stop_at))
+                    {
                         signal_service_stop(service, &mut running_services, &mut service_stop_deadlines, &mut service_grace_alerted, SignalKind::Term, second);
                     }
-                    if start.matches(second)
-                        && service_fired_seconds.insert((uuid, "start", second))
+                    if let Some(start_at) = start_at
+                        && service_fired_seconds.insert((uuid, "start", start_at))
                         && !running_services.contains_key(&uuid)
                     {
                         let running_service = spawn_service_process(
@@ -561,11 +612,22 @@ async fn handle_job_completion(
     completion_tx: mpsc::UnboundedSender<JobCompletion>,
     completion: JobCompletion,
 ) {
+    let upstream_name = config
+        .jobs
+        .iter()
+        .find(|job| job.uuid == Some(completion.uuid))
+        .map(|job| job.name.clone())
+        .unwrap_or_else(|| completion.name.clone());
     for job in config.jobs.iter().filter(|job| {
-        matches!(
-            &job.trigger,
-            JobTrigger::After(upstream) if upstream == &completion.name
-        )
+        let JobTrigger::After(upstream) = &job.trigger else {
+            return false;
+        };
+        config
+            .jobs
+            .iter()
+            .find(|candidate| candidate.name == *upstream)
+            .and_then(|candidate| candidate.uuid)
+            == Some(completion.uuid)
     }) {
         let Some(uuid) = job.uuid else {
             continue;
@@ -585,7 +647,7 @@ async fn handle_job_completion(
             completion_tx.clone(),
             true,
             RunTrigger::Dependency {
-                upstream: completion.name.clone(),
+                upstream: upstream_name.clone(),
             },
         );
         running.insert(uuid, running_job);
@@ -772,11 +834,7 @@ fn service_is_inside_runtime(service: &ServiceConfig, now: DateTime<Local>) -> b
     let ServiceSchedule::Window { start, stop } = &service.schedule else {
         return true;
     };
-    let mut starts = start.next_runs(now - chrono::Duration::days(366 * 5), 10_000);
-    let mut stops = stop.next_runs(now - chrono::Duration::days(366 * 5), 10_000);
-    starts.retain(|time| *time <= now);
-    stops.retain(|time| *time <= now);
-    match (starts.last(), stops.last()) {
+    match (start.previous_run(now), stop.previous_run(now)) {
         (Some(start), Some(stop)) => start > stop,
         (Some(_), None) => true,
         _ => false,
@@ -799,6 +857,65 @@ fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use crate::config::{AlertConfig, JobConfig, ServiceSchedule};
+    use chrono::TimeZone;
+
+    fn schedule(expression: &str) -> Schedule {
+        serde_yaml::from_str(&format!("\"{expression}\"")).unwrap()
+    }
+
+    #[test]
+    fn missed_run_policy_skips_or_coalesces_missed_occurrences() {
+        let schedule = schedule("0 * * * * *");
+        let previous = Local.with_ymd_and_hms(2026, 7, 14, 10, 0, 1).unwrap();
+        let current = Local.with_ymd_and_hms(2026, 7, 14, 10, 2, 3).unwrap();
+
+        assert_eq!(
+            scheduled_occurrence(&schedule, MissedRunPolicy::Skip, previous, current),
+            None
+        );
+        assert_eq!(
+            scheduled_occurrence(&schedule, MissedRunPolicy::RunOnce, previous, current),
+            Some(Local.with_ymd_and_hms(2026, 7, 14, 10, 2, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn missed_service_transitions_apply_only_the_latest_event() {
+        let start = schedule("0 0 9 * * *");
+        let stop = schedule("0 0 17 * * *");
+        let previous = Local.with_ymd_and_hms(2026, 7, 13, 8, 0, 0).unwrap();
+        let current = Local.with_ymd_and_hms(2026, 7, 14, 18, 0, 0).unwrap();
+
+        assert_eq!(
+            service_occurrences(&start, &stop, MissedRunPolicy::RunOnce, previous, current,),
+            (
+                None,
+                Some(Local.with_ymd_and_hms(2026, 7, 14, 17, 0, 0).unwrap())
+            )
+        );
+    }
+
+    #[test]
+    fn service_runtime_lookup_handles_more_than_five_years() {
+        let service = ServiceConfig {
+            uuid: Some(Uuid::new_v4()),
+            name: "leap-window".to_string(),
+            command: "true".to_string(),
+            schedule: ServiceSchedule::Window {
+                start: schedule("0 0 0 29 feb *"),
+                stop: schedule("0 0 0 1 mar *"),
+            },
+            stop_grace_period: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+
+        assert!(service_is_inside_runtime(
+            &service,
+            Local.with_ymd_and_hms(2104, 2, 29, 12, 0, 0).unwrap()
+        ));
+    }
 
     fn manual_job(name: &str) -> JobConfig {
         JobConfig {
@@ -819,6 +936,8 @@ mod tests {
             log_dir: PathBuf::from("logs"),
             service_log: PathBuf::from("sundiald.log"),
             api_bind: "127.0.0.1:0".parse().unwrap(),
+            api_token: None,
+            missed_run_policy: crate::config::MissedRunPolicy::Skip,
             log_retention_days: 14,
             shutdown_grace_period: "30s".to_string(),
             alert: AlertConfig::default(),
@@ -842,6 +961,8 @@ mod tests {
             log_dir,
             service_log: temp.path().join("sundiald.log"),
             api_bind: "127.0.0.1:0".parse().unwrap(),
+            api_token: None,
+            missed_run_policy: crate::config::MissedRunPolicy::Skip,
             log_retention_days: 14,
             shutdown_grace_period: "30s".to_string(),
             alert: AlertConfig::default(),
@@ -864,6 +985,7 @@ mod tests {
             running_controls,
             completion_tx,
             JobCompletion {
+                uuid: upstream.uuid.unwrap(),
                 name: upstream.name,
                 success: true,
             },
@@ -874,6 +996,43 @@ mod tests {
         let completion = completion_rx.recv().await.unwrap();
         assert_eq!(completion.name, "deploy");
         assert!(completion.success);
+    }
+
+    #[tokio::test]
+    async fn completion_dependencies_follow_uuid_across_an_upstream_rename() {
+        let temp = tempfile::tempdir().unwrap();
+        let old_name = "build";
+        let mut upstream = manual_job("compile");
+        let mut downstream = manual_job("deploy");
+        downstream.trigger = JobTrigger::After(upstream.name.clone());
+        let mut config = test_config_with_jobs(vec![upstream.clone(), downstream.clone()]);
+        config.state_dir = temp.path().to_path_buf();
+        config.log_dir = temp.path().join("logs");
+        config.service_log = temp.path().join("sundiald.log");
+        tokio::fs::create_dir_all(&config.log_dir).await.unwrap();
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(job_identities(&config))));
+        let running_controls = Arc::new(Mutex::new(HashMap::new()));
+        let (completion_tx, mut completion_rx) = mpsc::unbounded_channel();
+        let mut running = HashMap::new();
+
+        handle_job_completion(
+            &config,
+            &mut running,
+            history,
+            state,
+            running_controls,
+            completion_tx,
+            JobCompletion {
+                uuid: upstream.uuid.take().unwrap(),
+                name: old_name.to_string(),
+                success: true,
+            },
+        )
+        .await;
+
+        assert!(running.contains_key(&downstream.uuid.unwrap()));
+        assert_eq!(completion_rx.recv().await.unwrap().name, "deploy");
     }
 
     #[tokio::test]

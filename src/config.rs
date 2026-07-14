@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub use schedule::Schedule;
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SundialdConfig {
     #[serde(default = "default_state_dir")]
     pub state_dir: PathBuf,
@@ -25,6 +26,10 @@ pub struct SundialdConfig {
     pub service_log: PathBuf,
     #[serde(default = "default_api_bind")]
     pub api_bind: SocketAddr,
+    #[serde(default)]
+    pub api_token: Option<String>,
+    #[serde(default)]
+    pub missed_run_policy: MissedRunPolicy,
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u32,
     #[serde(default = "default_shutdown_grace_period")]
@@ -39,6 +44,23 @@ pub struct SundialdConfig {
     pub jobs: Vec<JobConfig>,
     #[serde(default)]
     pub services: Vec<ServiceConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MissedRunPolicy {
+    #[default]
+    Skip,
+    RunOnce,
+}
+
+impl std::fmt::Display for MissedRunPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Skip => write!(f, "skip"),
+            Self::RunOnce => write!(f, "run_once"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -66,6 +88,7 @@ impl JobFileContents {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlertConfig {
     #[serde(default = "default_alert_log")]
     pub log: PathBuf,
@@ -80,6 +103,7 @@ pub struct AlertConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AlertCommandConfig {
     pub program: String,
     #[serde(default)]
@@ -87,6 +111,7 @@ pub struct AlertCommandConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PushoverConfig {
     pub token: String,
     pub user: String,
@@ -107,6 +132,7 @@ pub struct PushoverConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JobConfig {
     /// Stable identity used to track a job across renames. Absent for a
     /// hand-written or freshly generated config; `load_and_ensure_ids` fills
@@ -135,6 +161,7 @@ pub struct JobConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServiceConfig {
     #[serde(default)]
     pub uuid: Option<Uuid>,
@@ -367,6 +394,15 @@ impl SundialdConfig {
         duration::parse_duration(&self.shutdown_grace_period)
             .context("invalid shutdown_grace_period")?;
 
+        if let Some(token) = &self.api_token
+            && token.trim().is_empty()
+        {
+            bail!("api_token cannot be empty");
+        }
+        if !self.api_bind.ip().is_loopback() && self.api_token.is_none() {
+            bail!("api_token is required when api_bind is not a loopback address");
+        }
+
         if let Some(command) = &self.alert.command {
             if command.program.trim().is_empty() {
                 bail!("alert.command.program cannot be empty");
@@ -480,6 +516,7 @@ impl SundialdConfig {
                 }
             }
         }
+        validate_dependency_cycles(&self.jobs)?;
         Ok(())
     }
 
@@ -573,6 +610,51 @@ impl SundialdConfig {
 
         Ok(config)
     }
+}
+
+fn validate_dependency_cycles(jobs: &[JobConfig]) -> Result<()> {
+    let dependencies = jobs
+        .iter()
+        .filter_map(|job| {
+            job.trigger
+                .after()
+                .map(|upstream| (job.name.clone(), upstream.to_string()))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut colors = HashMap::<String, u8>::new();
+    let mut path = Vec::new();
+
+    for job in jobs {
+        visit_dependency(&job.name, &dependencies, &mut colors, &mut path)?;
+    }
+    Ok(())
+}
+
+fn visit_dependency(
+    name: &str,
+    dependencies: &HashMap<String, String>,
+    colors: &mut HashMap<String, u8>,
+    path: &mut Vec<String>,
+) -> Result<()> {
+    match colors.get(name).copied() {
+        Some(2) => return Ok(()),
+        Some(1) => {
+            let start = path.iter().position(|entry| entry == name).unwrap_or(0);
+            let mut cycle = path[start..].to_vec();
+            cycle.push(name.to_string());
+            bail!("dependency cycle detected: {}", cycle.join(" -> "));
+        }
+        _ => {}
+    }
+
+    colors.insert(name.to_string(), 1);
+    path.push(name.to_string());
+    if let Some(upstream) = dependencies.get(name) {
+        visit_dependency(upstream, dependencies, colors, path)?;
+    }
+    path.pop();
+    colors.insert(name.to_string(), 2);
+    Ok(())
 }
 
 fn validate_env(env: &HashMap<String, String>, context: &str) -> Result<()> {
@@ -680,6 +762,11 @@ pub fn sample_config() -> String {
 log_dir: {log_dir}
 service_log: {service_log}
 api_bind: 127.0.0.1:8787
+# Required when api_bind is not a loopback address. CLI commands send it as a bearer token.
+# api_token: "replace-with-a-long-random-secret"
+# What to do when the daemon misses scheduled seconds while suspended or busy:
+# `skip` ignores them; `run_once` runs each affected job once after recovery.
+missed_run_policy: skip
 # Delete job log files older than this many days. Set to 0 to keep logs forever.
 log_retention_days: 14
 # Time to wait for running processes to exit after SIGTERM during daemon shutdown.
@@ -879,6 +966,97 @@ jobs:
         .unwrap();
 
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn config_rejects_dependency_cycles() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+jobs:
+  - name: first
+    command: "true"
+    trigger: { after: second }
+  - name: second
+    command: "true"
+    trigger: { after: first }
+"#,
+        )
+        .unwrap();
+
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("first -> second -> first"));
+    }
+
+    #[test]
+    fn config_rejects_self_dependency() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+jobs:
+  - name: loop
+    command: "true"
+    trigger: { after: loop }
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("loop -> loop")
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields_at_every_config_level() {
+        for yaml in [
+            "api_bnid: 127.0.0.1:8787\n",
+            "alert:\n  retntion_days: 7\n",
+            "jobs:\n  - name: job\n    command: 'true'\n    trigger: manual\n    commnad: 'false'\n",
+            "services:\n  - name: service\n    command: 'true'\n    schedule: permanent\n    stop_grace: 5s\n",
+        ] {
+            assert!(
+                serde_yaml::from_str::<SundialdConfig>(yaml).is_err(),
+                "{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_loopback_api_requires_a_nonempty_token() {
+        let config: SundialdConfig = serde_yaml::from_str("api_bind: 0.0.0.0:8787\n").unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("api_token is required")
+        );
+
+        let empty: SundialdConfig =
+            serde_yaml::from_str("api_bind: 127.0.0.1:8787\napi_token: ''\n").unwrap();
+        assert!(
+            empty
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be empty")
+        );
+
+        let configured: SundialdConfig =
+            serde_yaml::from_str("api_bind: 0.0.0.0:8787\napi_token: secret\n").unwrap();
+        assert!(configured.validate().is_ok());
+    }
+
+    #[test]
+    fn missed_run_policy_defaults_to_skip_and_accepts_run_once() {
+        let default: SundialdConfig = serde_yaml::from_str("jobs: []\n").unwrap();
+        let run_once: SundialdConfig =
+            serde_yaml::from_str("missed_run_policy: run_once\n").unwrap();
+
+        assert_eq!(default.missed_run_policy, MissedRunPolicy::Skip);
+        assert_eq!(run_once.missed_run_policy, MissedRunPolicy::RunOnce);
     }
 
     #[test]
@@ -1246,6 +1424,8 @@ alert:
             log_dir: default_log_dir(),
             service_log: default_service_log(),
             api_bind: default_api_bind(),
+            api_token: None,
+            missed_run_policy: MissedRunPolicy::Skip,
             log_retention_days: default_log_retention_days(),
             shutdown_grace_period: default_shutdown_grace_period(),
             alert: AlertConfig::default(),

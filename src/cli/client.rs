@@ -1,9 +1,34 @@
+use std::{sync::OnceLock, time::Duration};
+
 use anyhow::Result;
 
 use crate::{config::SundialdConfig, service};
 
 pub(crate) fn api_base(config: &SundialdConfig) -> String {
     format!("http://{}", config.api_bind)
+}
+
+pub(crate) fn api_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(3))
+                .timeout(Duration::from_secs(10))
+                .build()
+                .expect("fixed CLI HTTP client settings must be valid")
+        })
+        .clone()
+}
+
+pub(crate) fn authorize(
+    config: &SundialdConfig,
+    request: reqwest::RequestBuilder,
+) -> reqwest::RequestBuilder {
+    match &config.api_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    }
 }
 
 pub(crate) fn encode_path_segment(value: &str) -> String {
@@ -22,29 +47,33 @@ pub(crate) fn encode_path_segment(value: &str) -> String {
 /// POSTs to `path` on the configured sundiald API, with a uniform connection
 /// error message shared by every CLI command that talks to the API.
 pub(crate) async fn post_api(config: &SundialdConfig, path: &str) -> Result<reqwest::Response> {
-    reqwest::Client::new()
-        .post(format!("{}{path}", api_base(config)))
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to connect to sundiald api at {}: {error:#}",
-                api_base(config)
-            )
-        })
+    authorize(
+        config,
+        api_client().post(format!("{}{path}", api_base(config))),
+    )
+    .send()
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to connect to sundiald api at {}: {error:#}",
+            api_base(config)
+        )
+    })
 }
 
 pub(crate) async fn get_api(config: &SundialdConfig, path: &str) -> Result<reqwest::Response> {
-    reqwest::Client::new()
-        .get(format!("{}{path}", api_base(config)))
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to connect to sundiald api at {}: {error:#}",
-                api_base(config)
-            )
-        })
+    authorize(
+        config,
+        api_client().get(format!("{}{path}", api_base(config))),
+    )
+    .send()
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to connect to sundiald api at {}: {error:#}",
+            api_base(config)
+        )
+    })
 }
 
 pub(crate) async fn report_response(
@@ -63,21 +92,23 @@ pub(crate) async fn report_response(
 }
 
 pub(crate) async fn fetch_status(config: &SundialdConfig) -> Result<service::StatusResponse> {
-    reqwest::Client::new()
-        .get(format!("{}/status", api_base(config)))
-        .send()
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(
-                "failed to connect to sundiald api at {}: {error:#}",
-                api_base(config)
-            )
-        })?
-        .error_for_status()
-        .map_err(|error| anyhow::anyhow!("sundiald api returned an error: {error}"))?
-        .json()
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to parse sundiald api status response: {error}"))
+    authorize(
+        config,
+        api_client().get(format!("{}/status", api_base(config))),
+    )
+    .send()
+    .await
+    .map_err(|error| {
+        anyhow::anyhow!(
+            "failed to connect to sundiald api at {}: {error:#}",
+            api_base(config)
+        )
+    })?
+    .error_for_status()
+    .map_err(|error| anyhow::anyhow!("sundiald api returned an error: {error}"))?
+    .json()
+    .await
+    .map_err(|error| anyhow::anyhow!("failed to parse sundiald api status response: {error}"))
 }
 
 #[cfg(test)]
@@ -89,5 +120,19 @@ mod tests {
         assert_eq!(encode_path_segment("simple-job_1"), "simple-job_1");
         assert_eq!(encode_path_segment("a/b?c#d e"), "a%2Fb%3Fc%23d%20e");
         assert_eq!(encode_path_segment("cafe\u{301}"), "cafe%CC%81");
+    }
+
+    #[test]
+    fn authorize_adds_the_configured_bearer_token() {
+        let config: SundialdConfig =
+            serde_yaml::from_str("api_token: test-secret\njobs: []\n").unwrap();
+        let request = authorize(&config, api_client().get("http://127.0.0.1/status"))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            request.headers()[reqwest::header::AUTHORIZATION],
+            "Bearer test-secret"
+        );
     }
 }

@@ -67,6 +67,7 @@ enum ProcessKind {
 
 #[derive(Debug, Clone)]
 pub(crate) struct JobCompletion {
+    pub(crate) uuid: Uuid,
     pub(crate) name: String,
     pub(crate) success: bool,
 }
@@ -199,6 +200,9 @@ async fn run_job(
     trigger: RunTrigger,
     process_kind: ProcessKind,
 ) -> JobCompletion {
+    let uuid = job
+        .uuid
+        .expect("job uuid must be assigned before running (see load_and_ensure_ids)");
     match run_job_inner(
         job.clone(),
         log_dir,
@@ -223,6 +227,7 @@ async fn run_job(
             )
             .await;
             JobCompletion {
+                uuid,
                 name: job.name,
                 success: false,
             }
@@ -370,6 +375,7 @@ async fn run_job_inner(
             .await;
             write_alert(&alert, &job.name, &message).await;
             return Ok(JobCompletion {
+                uuid,
                 name: job.name,
                 success: false,
             });
@@ -624,6 +630,7 @@ async fn run_job_inner(
     }
 
     Ok(JobCompletion {
+        uuid,
         name: job.name,
         success: final_success,
     })

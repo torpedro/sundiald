@@ -22,6 +22,11 @@ state_dir: /home/you/.local/state/sundiald
 log_dir: /home/you/.local/state/sundiald/logs
 service_log: /home/you/.local/state/sundiald/sundiald.log
 api_bind: 127.0.0.1:8787
+# Required when api_bind is not a loopback address. CLI commands send it as a bearer token.
+# api_token: "replace-with-a-long-random-secret"
+# What to do when the daemon misses scheduled seconds while suspended or busy:
+# `skip` ignores them; `run_once` runs each affected job once after recovery.
+missed_run_policy: skip
 # Delete job log files older than this many days. Set to 0 to keep logs forever.
 log_retention_days: 14
 # Time to wait for running processes to exit after SIGTERM during daemon shutdown.
@@ -84,6 +89,8 @@ services:
 Each job has one `trigger`: `schedule`, `after`, or `manual`. Scheduled jobs run by time. Dependency jobs use `trigger.after: <job-name>` and run when that upstream job finishes successfully, including when the upstream was started manually. Manual jobs never run automatically but remain runnable through the CLI/API/UI.
 
 Schedules use a six-field cron expression under `trigger.schedule`: `second minute hour day-of-month month day-of-week`. Fields accept `*`, exact numbers, ranges like `1-5`, steps like `*/15`, and comma-separated values like `1,15,30`. Seconds and minutes use `0` through `59`; hours use `0` through `23`. Weekdays accept `mon` through `sun`; months accept `jan` through `dec` or `1` through `12`.
+
+`missed_run_policy` controls schedule ticks missed while the daemon process is alive but delayed or suspended. The default, `skip`, only considers the current second. `run_once` starts each affected job once after recovery, using its most recent missed occurrence; it does not replay every missed occurrence and does not catch up time elapsed while sundiald was stopped. For windowed services, only the most recent missed start or stop transition is applied.
 
 Service entries are for commands expected to keep running. `schedule: permanent` declares a manually controlled service with no automatic start/stop times. A window schedule uses `schedule.start` and `schedule.stop`, both six-field cron expressions; matching `start` ticks start the service if it is not already running, and matching `stop` ticks send SIGTERM. Services are not automatically started when the daemon starts or reloads, even if they are permanent or currently inside a configured runtime window. Use `stop_grace_period` to control how long sundiald waits after a service is outside its runtime before alerting that it is still running; the default is `30s`.
 
@@ -151,7 +158,7 @@ Run history is recorded in a WAL-mode SQLite database at `state_dir/history.sqli
 cargo run -- reload
 ```
 
-Reloads the config from disk without restarting — this picks up job/schedule/log/alert changes. The config and its output destinations are validated before being swapped in; an invalid or unusable configuration is rejected and the service keeps running on its previous config. Changing `api_bind` or `state_dir` requires a full restart because the listener and history database are initialized at daemon startup.
+Reloads the config from disk without restarting — this picks up job/schedule/log/alert changes. The config and its output destinations are validated before being swapped in; an invalid or unusable configuration is rejected and the service keeps running on its previous config. Changing `api_bind`, `api_token`, or `state_dir` requires a full restart because the listener, authentication middleware, and history database are initialized at daemon startup.
 
 When the daemon shuts down, it sends SIGTERM to running jobs and services, waits up to `shutdown_grace_period` for jobs and up to each service's `stop_grace_period` when set, then escalates any remaining process groups to SIGKILL. This lets stdout/stderr logs, state, and SQLite history finish cleanly before the daemon exits.
 
@@ -247,7 +254,7 @@ Manual job runs and service controls are requested through the HTTP API and exec
 
 ## HTTP API
 
-`daemon` starts a local HTTP API at `api_bind`.
+`daemon` starts an HTTP API at `api_bind`. Loopback bindings do not require authentication. A non-loopback `api_bind` is rejected unless `api_token` is configured; all endpoints except `/health` then require `Authorization: Bearer <api_token>`. The bundled CLI reads the same config and supplies this header automatically. The API serves plain HTTP, so use a trusted private network or a TLS reverse proxy when exposing it beyond the host.
 
 ```sh
 curl http://127.0.0.1:8787/status

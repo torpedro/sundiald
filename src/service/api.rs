@@ -8,8 +8,9 @@ use std::{
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    extract::{Path as AxumPath, Query, State},
-    http::StatusCode,
+    extract::{Path as AxumPath, Query, Request, State},
+    http::{StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -153,8 +154,8 @@ pub(crate) async fn bind_api(bind: SocketAddr) -> Result<TcpListener> {
 }
 
 pub(crate) async fn run_api_on_listener(listener: TcpListener, state: ApiState) -> Result<()> {
-    let app = Router::new()
-        .route("/health", get(|| async { Json(json!({ "ok": true })) }))
+    let token = state.config.read().await.api_token.clone();
+    let protected = Router::new()
         .route("/status", get(api_status))
         .route("/jobs/{job}/run", post(api_run_job))
         .route("/jobs/{job}/terminate", post(api_terminate_job))
@@ -165,11 +166,38 @@ pub(crate) async fn run_api_on_listener(listener: TcpListener, state: ApiState) 
         .route("/services/{service}/stop", post(api_stop_service))
         .route("/services/{service}/kill", post(api_kill_service))
         .route("/services/{service}/logs/latest", get(api_latest_log))
-        .route("/reload", post(api_reload))
+        .route("/reload", post(api_reload));
+    let protected = if let Some(token) = token {
+        protected.layer(middleware::from_fn_with_state(token, require_api_token))
+    } else {
+        protected
+    };
+    let app = Router::new()
+        .route("/health", get(|| async { Json(json!({ "ok": true })) }))
+        .merge(protected)
         .with_state(state);
     axum::serve(listener, app)
         .await
         .context("api server failed")
+}
+
+async fn require_api_token(State(token): State<String>, request: Request, next: Next) -> Response {
+    let expected = format!("Bearer {token}");
+    let authorized = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value == expected);
+
+    if authorized {
+        next.run(request).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid bearer token" })),
+        )
+            .into_response()
+    }
 }
 
 async fn api_status(State(api): State<ApiState>) -> Json<StatusResponse> {
@@ -246,6 +274,9 @@ fn validate_reload_compatibility(
             current.api_bind,
             candidate.api_bind
         );
+    }
+    if candidate.api_token != current.api_token {
+        anyhow::bail!("api_token cannot be changed by reload; restart sundiald");
     }
     if candidate.state_dir != current.state_dir {
         anyhow::bail!(
@@ -1034,6 +1065,8 @@ mod tests {
             log_dir: state_dir.join("logs"),
             service_log: state_dir.join("sundiald.log"),
             api_bind: "127.0.0.1:0".parse().unwrap(),
+            api_token: None,
+            missed_run_policy: crate::config::MissedRunPolicy::Skip,
             log_retention_days: 14,
             shutdown_grace_period: "30s".to_string(),
             alert: AlertConfig::default(),
@@ -1115,6 +1148,65 @@ mod tests {
             running_controls: Arc::new(Mutex::new(HashMap::new())),
             history,
         }
+    }
+
+    #[tokio::test]
+    async fn api_token_protects_every_endpoint_except_health() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path().to_path_buf());
+        config.api_token = Some("test-secret".to_string());
+        let snapshot = StateSnapshot::new(
+            config
+                .jobs
+                .iter()
+                .map(|job| (job.uuid.unwrap(), job.name.clone())),
+        );
+        let api = test_api(config, snapshot);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_api_on_listener(listener, api));
+        let client = reqwest::Client::new();
+
+        assert_eq!(
+            client
+                .get(format!("http://{addr}/health"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            client
+                .get(format!("http://{addr}/status"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(format!("http://{addr}/status"))
+                .bearer_auth("wrong")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            client
+                .get(format!("http://{addr}/status"))
+                .bearer_auth("test-secret")
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+
+        handle.abort();
     }
 
     fn running_job_state(uuid: Uuid, name: &str) -> JobState {
@@ -1743,6 +1835,18 @@ jobs:
         .unwrap();
         let error = prepare_reload_config(&api).await.unwrap_err();
         assert!(error.to_string().contains("state_dir cannot be changed"));
+
+        tokio::fs::write(
+            &config_path,
+            format!(
+                "state_dir: {}\napi_bind: 127.0.0.1:8787\napi_token: new-secret\njobs: []\n",
+                temp.path().join("state").display()
+            ),
+        )
+        .await
+        .unwrap();
+        let error = prepare_reload_config(&api).await.unwrap_err();
+        assert!(error.to_string().contains("api_token cannot be changed"));
     }
 
     #[tokio::test]

@@ -142,6 +142,15 @@ async fn main() -> Result<()> {
             println!("shutdown_grace_period: {}", config.shutdown_grace_period);
             println!("service_log: {}", config.service_log.display());
             println!("api_bind: {}", config.api_bind);
+            println!(
+                "api_token: {}",
+                if config.api_token.is_some() {
+                    "configured"
+                } else {
+                    "not configured"
+                }
+            );
+            println!("missed_run_policy: {}", config.missed_run_policy);
             println!("alert.log: {}", config.alert.log.display());
             println!("alert.event_dir: {}", config.alert.event_dir.display());
             println!("alert.retention_days: {}", config.alert.retention_days);

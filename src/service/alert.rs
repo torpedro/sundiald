@@ -5,6 +5,7 @@ use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
     process::Command,
+    time::{Duration, timeout},
 };
 use uuid::Uuid;
 
@@ -83,6 +84,23 @@ async fn run_alert_command(
     message: &str,
     alert_file: &std::path::Path,
 ) -> Result<()> {
+    run_alert_command_with_timeout(
+        alert_command,
+        job_name,
+        message,
+        alert_file,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn run_alert_command_with_timeout(
+    alert_command: &AlertCommandConfig,
+    job_name: &str,
+    message: &str,
+    alert_file: &std::path::Path,
+    limit: Duration,
+) -> Result<()> {
     let args = alert_command
         .args
         .iter()
@@ -93,11 +111,25 @@ async fn run_alert_command(
         })
         .collect::<Vec<_>>();
 
-    let status = Command::new(&alert_command.program)
+    let mut child = Command::new(&alert_command.program)
         .args(args)
-        .status()
-        .await
+        .kill_on_drop(true)
+        .spawn()
         .with_context(|| format!("failed to run alert command {}", alert_command.program))?;
+    let status = match timeout(limit, child.wait()).await {
+        Ok(status) => status.with_context(|| {
+            format!("failed to wait for alert command {}", alert_command.program)
+        })?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            anyhow::bail!(
+                "alert command {} timed out after {}s",
+                alert_command.program,
+                limit.as_secs_f64()
+            );
+        }
+    };
     if !status.success() {
         eprintln!("alert command exited with status {status}");
     }
@@ -132,7 +164,12 @@ async fn send_pushover_alert(
         form.push(("ttl", ttl.to_string()));
     }
 
-    let response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(15))
+        .build()
+        .context("failed to build Pushover HTTP client")?;
+    let response = client
         .post("https://api.pushover.net/1/messages.json")
         .form(&form)
         .send()
@@ -196,5 +233,26 @@ mod tests {
 
         assert_eq!(body, "backup: job exited with status 42");
         assert!(!body.contains("alert_file"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn alert_command_is_killed_when_it_times_out() {
+        let command = AlertCommandConfig {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 5".to_string()],
+        };
+
+        let error = run_alert_command_with_timeout(
+            &command,
+            "job",
+            "message",
+            std::path::Path::new("alert.json"),
+            Duration::from_millis(20),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("timed out"));
     }
 }

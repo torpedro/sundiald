@@ -1,8 +1,13 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, Timelike};
 use serde::{Deserialize, Deserializer};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Schedule {
     pub seconds: Vec<String>,
     pub minutes: Vec<String>,
@@ -58,7 +63,7 @@ impl Schedule {
     }
 
     pub fn matches(&self, time: DateTime<Local>) -> bool {
-        let compiled = CompiledSchedule::compile(self);
+        let compiled = self.compiled();
         let second = time.second();
         let minute = time.minute();
         let hour = time.hour();
@@ -74,7 +79,7 @@ impl Schedule {
 
     /// Finds the next `count` run times at or after `after`.
     ///
-    /// Searches day-by-day (bounded to 5 years out) rather than second-by-second,
+    /// Searches day-by-day (bounded to 8 years out) rather than second-by-second,
     /// so a schedule that can never fire (e.g. day 31 restricted to February)
     /// returns quickly instead of scanning ~150 million seconds.
     pub fn next_runs(&self, after: DateTime<Local>, count: usize) -> Vec<DateTime<Local>> {
@@ -82,7 +87,7 @@ impl Schedule {
             return Vec::new();
         }
 
-        let compiled = CompiledSchedule::compile(self);
+        let compiled = self.compiled();
         if compiled.seconds.is_empty()
             || compiled.minutes.is_empty()
             || compiled.hours.is_empty()
@@ -95,7 +100,7 @@ impl Schedule {
 
         let start = after.with_nanosecond(0).unwrap_or(after) + chrono::Duration::seconds(1);
         let mut date = start.date_naive();
-        let last_date = date + chrono::Duration::days(366 * 5);
+        let last_date = date + chrono::Duration::days(366 * 8);
         let mut runs = Vec::new();
 
         while date <= last_date {
@@ -135,11 +140,70 @@ impl Schedule {
 
         runs
     }
+
+    /// Returns the most recent matching wall-clock second at or before `at`.
+    /// Eight years covers the longest possible gap in this cron grammar: a
+    /// leap-day schedule spanning a non-leap century (for example 2096-2104).
+    pub fn previous_run(&self, at: DateTime<Local>) -> Option<DateTime<Local>> {
+        let compiled = self.compiled();
+        let end = at.with_nanosecond(0).unwrap_or(at);
+        let mut date = end.date_naive();
+        let first_date = date - chrono::Duration::days(366 * 8);
+
+        while date >= first_date {
+            if compiled.day_matches(
+                date.month(),
+                date.day(),
+                date.weekday().number_from_monday(),
+            ) {
+                for &hour in compiled.hours.iter().rev() {
+                    for &minute in compiled.minutes.iter().rev() {
+                        for &second in compiled.seconds.iter().rev() {
+                            let time = chrono::NaiveTime::from_hms_opt(hour, minute, second)?;
+                            let Some(candidate) =
+                                date.and_time(time).and_local_timezone(Local).single()
+                            else {
+                                continue;
+                            };
+                            if candidate <= end {
+                                return Some(candidate);
+                            }
+                        }
+                    }
+                }
+            }
+            date = date.pred_opt()?;
+        }
+        None
+    }
+
+    pub fn latest_between(
+        &self,
+        after: DateTime<Local>,
+        through: DateTime<Local>,
+    ) -> Option<DateTime<Local>> {
+        self.previous_run(through).filter(|run| *run > after)
+    }
+
+    fn compiled(&self) -> Arc<CompiledSchedule> {
+        static CACHE: OnceLock<Mutex<HashMap<Schedule, Arc<CompiledSchedule>>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if cache.len() >= 1_024 && !cache.contains_key(self) {
+            cache.clear();
+        }
+        Arc::clone(
+            cache
+                .entry(self.clone())
+                .or_insert_with(|| Arc::new(CompiledSchedule::compile(self))),
+        )
+    }
 }
 
-/// Pre-parsed schedule fields as sorted value lists, computed once per
-/// `matches`/`next_runs` call instead of re-parsing the schedule strings on
-/// every second-level comparison.
+/// Pre-parsed schedule fields shared by all clones and calls for the same cron
+/// expression.
 struct CompiledSchedule {
     seconds: Vec<u32>,
     minutes: Vec<u32>,
@@ -423,6 +487,29 @@ jobs:
         let now = Local.with_ymd_and_hms(2026, 7, 4, 12, 0, 0).unwrap();
 
         assert!(schedule.next_runs(now, 3).is_empty());
+    }
+
+    #[test]
+    fn leap_day_search_crosses_a_non_leap_century() {
+        let schedule = Schedule::from_cron("0 0 0 29 feb *").unwrap();
+        let after = Local.with_ymd_and_hms(2097, 1, 1, 0, 0, 0).unwrap();
+        let through = Local.with_ymd_and_hms(2104, 12, 31, 0, 0, 0).unwrap();
+
+        assert_eq!(
+            schedule.next_runs(after, 1),
+            vec![Local.with_ymd_and_hms(2104, 2, 29, 0, 0, 0).unwrap()]
+        );
+        assert_eq!(
+            schedule.previous_run(through),
+            Some(Local.with_ymd_and_hms(2104, 2, 29, 0, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn compiled_schedules_are_cached() {
+        let schedule = Schedule::from_cron("0 * * * * *").unwrap();
+
+        assert!(Arc::ptr_eq(&schedule.compiled(), &schedule.compiled()));
     }
 
     #[test]

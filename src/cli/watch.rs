@@ -23,7 +23,7 @@ use tokio::{
     time::{self, Duration},
 };
 
-use super::client::{api_base, encode_path_segment, fetch_status};
+use super::client::{api_base, api_client, authorize, encode_path_segment, fetch_status};
 use crate::{config::SundialdConfig, service, state};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -714,10 +714,12 @@ async fn read_recent_log(config: &SundialdConfig, kind: EntryKind, uuid: uuid::U
         EntryKind::Job => format!("/jobs/{encoded_id}/logs/latest?tail=40"),
         EntryKind::Service => format!("/services/{encoded_id}/logs/latest?tail=40"),
     };
-    let response = reqwest::Client::new()
-        .get(format!("{}{}", api_base(config), path))
-        .send()
-        .await;
+    let response = authorize(
+        config,
+        api_client().get(format!("{}{}", api_base(config), path)),
+    )
+    .send()
+    .await;
     match response {
         Ok(response) if response.status().is_success() => {
             match response.json::<service::LogResponse>().await {
@@ -752,13 +754,15 @@ fn render_log_response(log: &service::LogResponse) -> String {
 
 async fn read_history(config: &SundialdConfig, job_uuid: uuid::Uuid) -> String {
     let encoded_job_id = encode_path_segment(&job_uuid.to_string());
-    let response = reqwest::Client::new()
-        .get(format!(
+    let response = authorize(
+        config,
+        api_client().get(format!(
             "{}/jobs/{encoded_job_id}/history?limit=10",
             api_base(config)
-        ))
-        .send()
-        .await;
+        )),
+    )
+    .send()
+    .await;
     match response {
         Ok(response) if response.status().is_success() => {
             match response.json::<service::HistoryResponse>().await {
@@ -821,10 +825,12 @@ fn format_duration_ms(duration_ms: i64) -> String {
 /// non-interactive commands, a failure here shouldn't exit the process, just
 /// update the status line with what happened.
 async fn post_watch_action(config: &SundialdConfig, path: &str, success_message: &str) -> String {
-    let response = reqwest::Client::new()
-        .post(format!("{}{path}", api_base(config)))
-        .send()
-        .await;
+    let response = authorize(
+        config,
+        api_client().post(format!("{}{path}", api_base(config))),
+    )
+    .send()
+    .await;
     match response {
         Ok(response) if response.status().is_success() => {
             format!("last command: {success_message}")

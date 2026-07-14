@@ -27,6 +27,8 @@ pub struct SundialdConfig {
     pub api_bind: SocketAddr,
     #[serde(default = "default_log_retention_days")]
     pub log_retention_days: u32,
+    #[serde(default = "default_shutdown_grace_period")]
+    pub shutdown_grace_period: String,
     #[serde(default)]
     pub alert: AlertConfig,
     #[serde(default)]
@@ -362,6 +364,9 @@ impl SundialdConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        duration::parse_duration(&self.shutdown_grace_period)
+            .context("invalid shutdown_grace_period")?;
+
         if let Some(command) = &self.alert.command {
             if command.program.trim().is_empty() {
                 bail!("alert.command.program cannot be empty");
@@ -484,6 +489,11 @@ impl SundialdConfig {
         self.service_log = resolve_path(base, &self.service_log);
         self.alert.log = resolve_path(base, &self.alert.log);
         self.alert.event_dir = resolve_path(base, &self.alert.event_dir);
+    }
+
+    pub fn shutdown_grace(&self) -> std::time::Duration {
+        duration::parse_duration(&self.shutdown_grace_period)
+            .unwrap_or_else(|_| std::time::Duration::from_secs(30))
     }
 
     /// Like `load`, but also assigns a fresh UUID to any job missing one and
@@ -637,6 +647,10 @@ fn default_log_retention_days() -> u32 {
     14
 }
 
+fn default_shutdown_grace_period() -> String {
+    "30s".to_string()
+}
+
 fn default_alert_retention_days() -> u32 {
     90
 }
@@ -668,6 +682,8 @@ service_log: {service_log}
 api_bind: 127.0.0.1:8787
 # Delete job log files older than this many days. Set to 0 to keep logs forever.
 log_retention_days: 14
+# Time to wait for running processes to exit after SIGTERM during daemon shutdown.
+shutdown_grace_period: "30s"
 alert:
   log: {alert_log}
   event_dir: {alert_event_dir}
@@ -791,6 +807,38 @@ jobs:
         .unwrap();
 
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_rejects_invalid_shutdown_grace_period() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+shutdown_grace_period: "not-a-duration"
+jobs:
+  - name: ok
+    command: "true"
+    trigger: manual
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn config_defaults_shutdown_grace_period_to_thirty_seconds() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+jobs:
+  - name: ok
+    command: "true"
+    trigger: manual
+"#,
+        )
+        .unwrap();
+
+        assert!(config.validate().is_ok());
+        assert_eq!(config.shutdown_grace(), std::time::Duration::from_secs(30));
     }
 
     #[test]
@@ -1199,6 +1247,7 @@ alert:
             service_log: default_service_log(),
             api_bind: default_api_bind(),
             log_retention_days: default_log_retention_days(),
+            shutdown_grace_period: default_shutdown_grace_period(),
             alert: AlertConfig::default(),
             env: HashMap::new(),
             job_files: Vec::new(),

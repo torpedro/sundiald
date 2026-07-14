@@ -18,6 +18,7 @@ use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
     sync::{Mutex, RwLock, mpsc},
+    task::JoinHandle,
     time,
 };
 use uuid::Uuid;
@@ -269,23 +270,113 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
         }
     }
 
-    for (_, running_job) in running {
-        let _ = running_job.control_tx.send(JobControl::Signal {
-            kind: SignalKind::Term,
-            expected: false,
-        });
-        running_job.handle.abort();
-    }
-    for (_, running_service) in running_services {
-        let _ = running_service.control_tx.send(JobControl::Signal {
-            kind: SignalKind::Term,
-            expected: true,
-        });
-        running_service.handle.abort();
-    }
     api_handle.abort();
+    let shutdown_config = config.read().await.clone();
+    graceful_shutdown_running(running, running_services, &shutdown_config).await;
 
     Ok(())
+}
+
+struct ShutdownTarget {
+    name: String,
+    control_tx: mpsc::UnboundedSender<JobControl>,
+    handle: JoinHandle<()>,
+    expected: bool,
+    deadline: time::Instant,
+    completed: bool,
+}
+
+async fn graceful_shutdown_running(
+    running: HashMap<Uuid, RunningJob>,
+    running_services: HashMap<Uuid, RunningJob>,
+    config: &SundialdConfig,
+) {
+    let now = time::Instant::now();
+    let default_grace = config.shutdown_grace();
+    let mut targets = Vec::with_capacity(running.len() + running_services.len());
+
+    for (uuid, running_job) in running {
+        let name = config
+            .jobs
+            .iter()
+            .find(|job| job.uuid == Some(uuid))
+            .map(|job| job.name.clone())
+            .unwrap_or_else(|| uuid.to_string());
+        targets.push(ShutdownTarget {
+            name,
+            control_tx: running_job.control_tx,
+            handle: running_job.handle,
+            expected: false,
+            deadline: now + default_grace,
+            completed: false,
+        });
+    }
+
+    for (uuid, running_service) in running_services {
+        let service = config
+            .services
+            .iter()
+            .find(|service| service.uuid == Some(uuid));
+        let name = service
+            .map(|service| service.name.clone())
+            .unwrap_or_else(|| uuid.to_string());
+        let grace = service
+            .map(ServiceConfig::stop_grace)
+            .unwrap_or(default_grace);
+        targets.push(ShutdownTarget {
+            name,
+            control_tx: running_service.control_tx,
+            handle: running_service.handle,
+            expected: true,
+            deadline: now + grace,
+            completed: false,
+        });
+    }
+
+    if targets.is_empty() {
+        return;
+    }
+
+    for target in &targets {
+        let _ = target.control_tx.send(JobControl::Signal {
+            kind: SignalKind::Term,
+            expected: target.expected,
+        });
+    }
+
+    for target in &mut targets {
+        let remaining = target
+            .deadline
+            .checked_duration_since(time::Instant::now())
+            .unwrap_or_default();
+        if time::timeout(remaining, &mut target.handle).await.is_ok() {
+            target.completed = true;
+        }
+    }
+
+    for target in targets.iter().filter(|target| !target.completed) {
+        eprintln!(
+            "sundiald shutdown escalating {} to SIGKILL after grace period",
+            target.name
+        );
+        let _ = target.control_tx.send(JobControl::Signal {
+            kind: SignalKind::Kill,
+            expected: target.expected,
+        });
+    }
+
+    for target in targets.iter_mut().filter(|target| !target.completed) {
+        match time::timeout(Duration::from_secs(5), &mut target.handle).await {
+            Ok(_) => target.completed = true,
+            Err(_) => {
+                eprintln!(
+                    "sundiald shutdown aborting task for {} after SIGKILL timeout",
+                    target.name
+                );
+                target.handle.abort();
+            }
+        }
+    }
 }
 
 /// `(uuid, name)` pairs for every configured runnable, for `StateSnapshot::new`/
@@ -638,7 +729,7 @@ fn absolutize_path(base: &Path, path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AlertConfig, JobConfig};
+    use crate::config::{AlertConfig, JobConfig, ServiceSchedule};
 
     fn manual_job(name: &str) -> JobConfig {
         JobConfig {
@@ -650,6 +741,22 @@ mod tests {
             group: None,
             env: HashMap::new(),
             source_path: None,
+        }
+    }
+
+    fn test_config_with_jobs(jobs: Vec<JobConfig>) -> SundialdConfig {
+        SundialdConfig {
+            state_dir: PathBuf::from("."),
+            log_dir: PathBuf::from("logs"),
+            service_log: PathBuf::from("sundiald.log"),
+            api_bind: "127.0.0.1:0".parse().unwrap(),
+            log_retention_days: 14,
+            shutdown_grace_period: "30s".to_string(),
+            alert: AlertConfig::default(),
+            env: HashMap::new(),
+            job_files: Vec::new(),
+            jobs,
+            services: Vec::new(),
         }
     }
 
@@ -667,6 +774,7 @@ mod tests {
             service_log: temp.path().join("sundiald.log"),
             api_bind: "127.0.0.1:0".parse().unwrap(),
             log_retention_days: 14,
+            shutdown_grace_period: "30s".to_string(),
             alert: AlertConfig::default(),
             env: HashMap::new(),
             job_files: Vec::new(),
@@ -697,5 +805,60 @@ mod tests {
         let completion = completion_rx.recv().await.unwrap();
         assert_eq!(completion.name, "deploy");
         assert!(completion.success);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_waits_for_job_after_sigterm_without_kill() {
+        let job = manual_job("quick-stop");
+        let uuid = job.uuid.unwrap();
+        let config = test_config_with_jobs(vec![job]);
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_task = Arc::clone(&seen);
+        let handle = tokio::spawn(async move {
+            if let Some(JobControl::Signal { kind, .. }) = control_rx.recv().await {
+                seen_in_task.lock().await.push(kind);
+            }
+        });
+        let mut running = HashMap::new();
+        running.insert(uuid, RunningJob { handle, control_tx });
+
+        graceful_shutdown_running(running, HashMap::new(), &config).await;
+
+        assert_eq!(*seen.lock().await, vec![SignalKind::Term]);
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_escalates_service_to_sigkill_after_service_grace() {
+        let service_id = Uuid::new_v4();
+        let mut config = test_config_with_jobs(Vec::new());
+        config.shutdown_grace_period = "1d".to_string();
+        config.services.push(ServiceConfig {
+            uuid: Some(service_id),
+            name: "stubborn-service".to_string(),
+            command: "sleep 60".to_string(),
+            schedule: ServiceSchedule::Permanent,
+            stop_grace_period: Some("0s".to_string()),
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        });
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_in_task = Arc::clone(&seen);
+        let handle = tokio::spawn(async move {
+            while let Some(JobControl::Signal { kind, .. }) = control_rx.recv().await {
+                seen_in_task.lock().await.push(kind);
+                if kind == SignalKind::Kill {
+                    break;
+                }
+            }
+        });
+        let mut running_services = HashMap::new();
+        running_services.insert(service_id, RunningJob { handle, control_tx });
+
+        graceful_shutdown_running(HashMap::new(), running_services, &config).await;
+
+        assert_eq!(*seen.lock().await, vec![SignalKind::Term, SignalKind::Kill]);
     }
 }

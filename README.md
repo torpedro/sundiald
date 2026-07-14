@@ -24,6 +24,8 @@ service_log: /home/you/.local/state/sundiald/sundiald.log
 api_bind: 127.0.0.1:8787
 # Delete job log files older than this many days. Set to 0 to keep logs forever.
 log_retention_days: 14
+# Time to wait for running processes to exit after SIGTERM during daemon shutdown.
+shutdown_grace_period: "30s"
 alert:
   log: /home/you/.local/state/sundiald/alerts.log
   event_dir: /home/you/.local/state/sundiald/alerts
@@ -150,6 +152,8 @@ cargo run -- reload
 ```
 
 Reloads the config from disk without restarting — this picks up job/schedule/log/alert changes. The config is validated before being swapped in; an invalid file is rejected and the service keeps running on its previous config. Changing `api_bind` still requires a full restart, since it means rebinding the HTTP listener.
+
+When the daemon shuts down, it sends SIGTERM to running jobs and services, waits up to `shutdown_grace_period` for jobs and up to each service's `stop_grace_period` when set, then escalates any remaining process groups to SIGKILL. This lets stdout/stderr logs, state, and SQLite history finish cleanly before the daemon exits.
 
 ## Install as a systemd service
 

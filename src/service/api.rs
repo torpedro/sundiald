@@ -966,6 +966,7 @@ mod tests {
             service_log: state_dir.join("sundiald.log"),
             api_bind: "127.0.0.1:0".parse().unwrap(),
             log_retention_days: 14,
+            shutdown_grace_period: "30s".to_string(),
             alert: AlertConfig::default(),
             env: HashMap::new(),
             job_files: Vec::new(),

@@ -139,6 +139,7 @@ async fn main() -> Result<()> {
             println!("state_dir: {}", config.state_dir.display());
             println!("log_dir: {}", config.log_dir.display());
             println!("log_retention_days: {}", config.log_retention_days);
+            println!("shutdown_grace_period: {}", config.shutdown_grace_period);
             println!("service_log: {}", config.service_log.display());
             println!("api_bind: {}", config.api_bind);
             println!("alert.log: {}", config.alert.log.display());

@@ -431,7 +431,7 @@ async fn run_job_inner(
             command = control_rx.recv() => {
                 if let Some(JobControl::Signal { kind: signal, expected }) = command {
                     terminated_by = Some(signal);
-                    expected_stop = expected;
+                    expected_stop |= expected;
                     if let Some(pid) = pid {
                         send_signal(pid, signal)?;
                         super::log_service_event(
@@ -448,8 +448,9 @@ async fn run_job_inner(
                         )
                         .await;
                     }
+                } else {
+                    break child.wait().await?;
                 }
-                break child.wait().await?;
             }
             _ = overrun_sleep => {
                 overrun_alerted = true;
@@ -985,6 +986,78 @@ mod tests {
         assert_eq!(
             service_state.terminated_by_signal.as_deref(),
             Some("SIGTERM")
+        );
+        assert!(!alert.event_dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_job_inner_accepts_sigkill_after_ignored_sigterm() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "stubborn-service".to_string(),
+            command: "trap '' TERM; while true; do sleep 1; done".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (control_tx, control_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = control_tx.send(JobControl::Signal {
+                kind: SignalKind::Term,
+                expected: true,
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let _ = control_tx.send(JobControl::Signal {
+                kind: SignalKind::Kill,
+                expected: true,
+            });
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            run_job_inner(
+                job,
+                temp.path().join("logs"),
+                temp.path().join("sundiald.log"),
+                alert.clone(),
+                temp.path().to_path_buf(),
+                history,
+                Arc::clone(&state),
+                control_rx,
+                false,
+                RunTrigger::ServiceManual,
+                ProcessKind::Service,
+            ),
+        )
+        .await
+        .expect("stubborn service should be killed")
+        .unwrap();
+
+        let snapshot = state.lock().await;
+        let service_state = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.uuid == job_id)
+            .expect("service state should be persisted");
+        assert!(matches!(service_state.status, JobStatus::Succeeded));
+        assert_eq!(
+            service_state.terminated_by_signal.as_deref(),
+            Some("SIGKILL")
         );
         assert!(!alert.event_dir.exists());
     }

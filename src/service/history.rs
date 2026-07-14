@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
@@ -48,6 +51,7 @@ impl HistoryDb {
         let path = self.path.clone();
         run_blocking(move || {
             let connection = open_connection(&path)?;
+            connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
             connection.execute_batch(SCHEMA)?;
             ensure_column(&connection, "log_path", "TEXT")?;
             ensure_column(&connection, "status", "TEXT")?;
@@ -55,6 +59,33 @@ impl HistoryDb {
             ensure_column(&connection, "error", "TEXT")?;
             migrate_trigger_kind_constraint(&connection)?;
             Ok(())
+        })
+        .await
+    }
+
+    pub(crate) async fn mark_unfinished_interrupted(
+        &self,
+        interrupted_at: DateTime<Local>,
+    ) -> Result<usize> {
+        let path = self.path.clone();
+        let interrupted_at = interrupted_at.to_rfc3339();
+        run_blocking(move || {
+            let connection = open_connection(&path)?;
+            let updated = connection.execute(
+                r#"
+                UPDATE job_runs
+                SET finished_at = ?1,
+                    duration_ms = MAX(
+                        0,
+                        CAST((julianday(?1) - julianday(triggered_at)) * 86400000 AS INTEGER)
+                    ),
+                    status = 'interrupted',
+                    error = COALESCE(error, 'sundiald restarted before run finished')
+                WHERE finished_at IS NULL
+                "#,
+                params![interrupted_at],
+            )?;
+            Ok(updated)
         })
         .await
     }
@@ -379,7 +410,12 @@ fn open_connection(path: &Path) -> Result<Connection> {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create history db dir {}", parent.display()))?;
     }
-    Connection::open(path).with_context(|| format!("failed to open history db {}", path.display()))
+    let connection = Connection::open(path)
+        .with_context(|| format!("failed to open history db {}", path.display()))?;
+    connection
+        .busy_timeout(Duration::from_secs(5))
+        .context("failed to configure history db busy timeout")?;
+    Ok(connection)
 }
 
 async fn run_blocking<T>(f: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T>
@@ -396,6 +432,19 @@ mod tests {
     use super::*;
     use crate::config::JobTrigger;
     use uuid::Uuid;
+
+    fn manual_job(name: String) -> JobConfig {
+        JobConfig {
+            uuid: Some(Uuid::new_v4()),
+            name,
+            command: "true".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: std::collections::HashMap::new(),
+            source_path: None,
+        }
+    }
 
     #[tokio::test]
     async fn records_trigger_and_finish_for_a_job_run() {
@@ -475,6 +524,91 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(latest_log.ends_with("example.log"));
+    }
+
+    #[tokio::test]
+    async fn startup_marks_unfinished_runs_as_interrupted() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let job = manual_job("unfinished".to_string());
+        let started_at = Local::now() - chrono::Duration::seconds(2);
+        history
+            .record_triggered(&job, started_at, "manual", &temp.path().join("run.log"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            history
+                .mark_unfinished_interrupted(Local::now())
+                .await
+                .unwrap(),
+            1
+        );
+
+        let runs = history.runs_for_job(job.uuid.unwrap(), 1).await.unwrap();
+        assert_eq!(runs[0].status.as_deref(), Some("interrupted"));
+        assert!(runs[0].finished_at.is_some());
+        assert!(runs[0].duration_ms.is_some_and(|duration| duration >= 0));
+        assert_eq!(
+            runs[0].error.as_deref(),
+            Some("sundiald restarted before run finished")
+        );
+        assert_eq!(
+            history
+                .mark_unfinished_interrupted(Local::now())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_history_writes_wait_instead_of_losing_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(21));
+        let mut tasks = Vec::new();
+
+        for index in 0..20 {
+            let history = history.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let log_path = temp.path().join(format!("run-{index}.log"));
+            tasks.push(tokio::spawn(async move {
+                let job = manual_job(format!("job-{index}"));
+                barrier.wait().await;
+                let started_at = Local::now();
+                let run_id = history
+                    .record_triggered(&job, started_at, "manual", &log_path)
+                    .await
+                    .unwrap();
+                history
+                    .record_finished(
+                        run_id,
+                        started_at,
+                        Local::now(),
+                        Some(0),
+                        "succeeded",
+                        None,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+            }));
+        }
+        barrier.wait().await;
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let connection = Connection::open(temp.path().join("history.sqlite3")).unwrap();
+        let count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM job_runs", [], |row| row.get(0))
+            .unwrap();
+        let journal_mode: String = connection
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 20);
+        assert_eq!(journal_mode, "wal");
     }
 
     #[tokio::test]

@@ -116,6 +116,7 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
     cleanup_old_files(&config.log_dir, config.log_retention_days).await;
     cleanup_old_files(&config.alert.event_dir, config.alert.retention_days).await;
     let history = HistoryDb::open(&config.state_dir).await?;
+    history.mark_unfinished_interrupted(Local::now()).await?;
 
     let loaded_snapshot = StateSnapshot::load(&config.state_dir).await?;
     if let Some(snapshot) = &loaded_snapshot {
@@ -125,7 +126,8 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
         .map(|snapshot| snapshot.reconcile(job_identities(&config)))
         .unwrap_or_else(|| StateSnapshot::new(job_identities(&config)));
     let state = Arc::new(Mutex::new(snapshot));
-    state.lock().await.save(&config.state_dir).await?;
+    let initial_snapshot = state.lock().await.clone();
+    initial_snapshot.save(&config.state_dir).await?;
 
     let job_count = config.jobs.len();
     let config = Arc::new(RwLock::new(config));

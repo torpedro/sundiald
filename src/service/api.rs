@@ -426,14 +426,18 @@ async fn api_latest_log(
     let runtime_base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let log_path = resolve_log_path(&config.log_dir, &runtime_base, &log_path);
     let stderr_log_path = stderr_log_path_for_stdout(&log_path);
-    match fs::read_to_string(&log_path).await {
+    match fs::read(&log_path).await {
         Ok(content) => {
+            let content = String::from_utf8_lossy(&content);
             let tail = query.tail.unwrap_or(40).clamp(1, 2_000);
-            let stderr = match fs::read_to_string(&stderr_log_path).await {
-                Ok(content) => Some((
-                    stderr_log_path,
-                    tail_lines(&content, tail).unwrap_or_else(|| "(empty log)".to_string()),
-                )),
+            let stderr = match fs::read(&stderr_log_path).await {
+                Ok(content) => {
+                    let content = String::from_utf8_lossy(&content);
+                    Some((
+                        stderr_log_path,
+                        tail_lines(&content, tail).unwrap_or_else(|| "(empty log)".to_string()),
+                    ))
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => {
                     return (
@@ -1398,7 +1402,7 @@ mod tests {
         tokio::fs::create_dir_all(log_path.parent().unwrap())
             .await
             .unwrap();
-        tokio::fs::write(&log_path, "one\ntwo\nthree\n")
+        tokio::fs::write(&log_path, b"one\n\xff\nthree\n")
             .await
             .unwrap();
         tokio::fs::write(&stderr_log_path, "warn\nerror\n")
@@ -1426,7 +1430,7 @@ mod tests {
 
         assert_eq!(log.uuid, job_id);
         assert!(log.log_path.is_absolute());
-        assert_eq!(log.content, "... 1 earlier line(s) omitted\ntwo\nthree");
+        assert_eq!(log.content, "... 1 earlier line(s) omitted\n�\nthree");
         assert_eq!(
             log.stderr_log_path.as_deref(),
             Some(stderr_log_path.as_path())

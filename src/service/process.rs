@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 use chrono::Local;
 use tokio::{
     fs::OpenOptions,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncReadExt, AsyncWriteExt},
     process::Command,
     sync::{Mutex, mpsc},
     task::JoinHandle,
@@ -237,8 +237,11 @@ async fn run_job(
 /// leaving an orphaned, unkillable process behind.
 async fn persist_state(state_dir: &Path, state: &Mutex<StateSnapshot>, job_state: JobState) {
     let job_name = job_state.name.clone();
-    let mut snapshot = state.lock().await;
-    snapshot.upsert(job_state);
+    let snapshot = {
+        let mut snapshot = state.lock().await;
+        snapshot.upsert(job_state);
+        snapshot.clone()
+    };
     if let Err(error) = snapshot.save(state_dir).await {
         eprintln!("failed to persist state for job '{job_name}': {error:#}");
     }
@@ -292,7 +295,11 @@ async fn run_job_inner(
         .expect("job uuid must be assigned before running (see load_and_ensure_ids)");
     let started_at = Local::now();
     let job_log_dir = log_dir.join(super::sanitize_name(&job.name));
-    let log_stem = started_at.format("%Y%m%d%H%M%S").to_string();
+    let log_stem = format!(
+        "{}-{}",
+        started_at.format("%Y%m%d%H%M%S%.6f"),
+        Uuid::new_v4()
+    );
     let stdout_log_path = job_log_dir.join(format!("{log_stem}.stdout.log"));
     let stderr_log_path = job_log_dir.join(format!("{log_stem}.stderr.log"));
     let history_run_id = match history
@@ -656,48 +663,46 @@ fn send_signal(_pid: u32, signal: SignalKind) -> Result<()> {
     anyhow::bail!("{} is not supported on this platform", signal.name())
 }
 
-async fn copy_stream(stream: impl tokio::io::AsyncRead + Unpin, log_path: PathBuf) -> Result<()> {
-    let mut reader = BufReader::new(stream).lines();
+async fn copy_stream(
+    mut stream: impl tokio::io::AsyncRead + Unpin,
+    log_path: PathBuf,
+) -> Result<()> {
     if let Some(parent) = log_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+        .create_new(true)
+        .write(true)
         .open(&log_path)
         .await
         .with_context(|| format!("failed to open log {}", log_path.display()))?;
 
-    while let Some(line) = reader.next_line().await? {
-        file.write_all(format!("{line}\n").as_bytes()).await?;
-    }
-
+    tokio::io::copy(&mut stream, &mut file).await?;
+    file.flush().await?;
     Ok(())
 }
 
 async fn copy_stream_lazy(
-    stream: impl tokio::io::AsyncRead + Unpin,
+    mut stream: impl tokio::io::AsyncRead + Unpin,
     log_path: PathBuf,
 ) -> Result<()> {
-    let mut reader = BufReader::new(stream).lines();
-    let Some(first_line) = reader.next_line().await? else {
+    let mut first_chunk = [0_u8; 8192];
+    let count = stream.read(&mut first_chunk).await?;
+    if count == 0 {
         return Ok(());
-    };
+    }
     if let Some(parent) = log_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
     }
     let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+        .create_new(true)
+        .write(true)
         .open(&log_path)
         .await
         .with_context(|| format!("failed to open log {}", log_path.display()))?;
-    file.write_all(format!("{first_line}\n").as_bytes()).await?;
-
-    while let Some(line) = reader.next_line().await? {
-        file.write_all(format!("{line}\n").as_bytes()).await?;
-    }
-
+    file.write_all(&first_chunk[..count]).await?;
+    tokio::io::copy(&mut stream, &mut file).await?;
+    file.flush().await?;
     Ok(())
 }
 
@@ -946,6 +951,112 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(stderr_path).await.unwrap(),
             "err\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_job_inner_preserves_binary_and_partial_stream_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "binary-streams".to_string(),
+            command: "printf '\\377\\000A'; printf '\\376\\000B' >&2".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+
+        run_job_inner(
+            job,
+            temp.path().join("logs"),
+            temp.path().join("sundiald.log"),
+            alert,
+            temp.path().to_path_buf(),
+            history,
+            Arc::clone(&state),
+            control_rx,
+            false,
+            RunTrigger::Manual,
+            ProcessKind::Job,
+        )
+        .await
+        .unwrap();
+
+        let snapshot = state.lock().await;
+        let stdout_path = snapshot.jobs[0].log_path.as_ref().unwrap();
+        let stderr_path = stdout_path.with_file_name(
+            stdout_path
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .replace(".stdout.log", ".stderr.log"),
+        );
+        assert_eq!(tokio::fs::read(stdout_path).await.unwrap(), [255, 0, b'A']);
+        assert_eq!(tokio::fs::read(stderr_path).await.unwrap(), [254, 0, b'B']);
+    }
+
+    #[tokio::test]
+    async fn repeated_runs_use_distinct_log_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "quick".to_string(),
+            command: "printf run".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+
+        for _ in 0..2 {
+            let (_control_tx, control_rx) = mpsc::unbounded_channel();
+            run_job_inner(
+                job.clone(),
+                temp.path().join("logs"),
+                temp.path().join("sundiald.log"),
+                alert.clone(),
+                temp.path().to_path_buf(),
+                history.clone(),
+                Arc::clone(&state),
+                control_rx,
+                false,
+                RunTrigger::Manual,
+                ProcessKind::Job,
+            )
+            .await
+            .unwrap();
+        }
+
+        let runs = history.runs_for_job(job_id, 2).await.unwrap();
+        assert_eq!(runs.len(), 2);
+        assert_ne!(runs[0].log_path, runs[1].log_path);
+        assert!(
+            runs.iter()
+                .all(|run| run.log_path.as_ref().unwrap().exists())
         );
     }
 

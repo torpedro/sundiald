@@ -86,6 +86,7 @@ mod tests {
     fn orphan_candidates_only_include_previously_running_jobs_with_pids() {
         let snapshot = StateSnapshot {
             updated_at: Local::now(),
+            revision: 0,
             jobs: vec![
                 job_state("running", JobStatus::Running, Some(123)),
                 job_state("missing-pid", JobStatus::Running, None),

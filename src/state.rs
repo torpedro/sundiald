@@ -1,18 +1,21 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     io::ErrorKind,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
 };
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
-use tokio::fs;
+use tokio::{fs, fs::OpenOptions, io::AsyncWriteExt, sync::Mutex};
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StateSnapshot {
     pub updated_at: DateTime<Local>,
+    #[serde(default)]
+    pub revision: u64,
     pub jobs: Vec<JobState>,
 }
 
@@ -88,6 +91,7 @@ impl StateSnapshot {
     pub fn new(jobs: impl IntoIterator<Item = (Uuid, String)>) -> Self {
         Self {
             updated_at: Local::now(),
+            revision: 0,
             jobs: jobs
                 .into_iter()
                 .map(|(uuid, name)| idle_job_state(uuid, name))
@@ -145,6 +149,7 @@ impl StateSnapshot {
 
         self.jobs = jobs;
         self.updated_at = Local::now();
+        self.revision = self.revision.saturating_add(1);
         self
     }
 
@@ -157,16 +162,71 @@ impl StateSnapshot {
         by_uuid.insert(state.uuid, state);
         self.jobs = by_uuid.into_values().collect();
         self.updated_at = Local::now();
+        self.revision = self.revision.saturating_add(1);
     }
 
     pub async fn save(&self, state_dir: &Path) -> Result<()> {
         fs::create_dir_all(state_dir).await?;
         let path = state_path(state_dir);
+        let write_lock = state_write_lock(&path);
+        let _guard = write_lock.lock().await;
+
+        // A completion with an older cloned snapshot may reach disk after a
+        // newer completion. Never let that late write roll state.json back.
+        if let Ok(bytes) = fs::read(&path).await
+            && let Ok(existing) = serde_json::from_slice::<Self>(&bytes)
+            && existing.revision > self.revision
+        {
+            return Ok(());
+        }
+
         let encoded = serde_json::to_vec_pretty(self)?;
-        fs::write(&path, encoded)
-            .await
-            .with_context(|| format!("failed to write {}", path.display()))
+        let temp_path = state_dir.join(format!(".state.json.{}.tmp", Uuid::new_v4()));
+        let write_result = async {
+            let mut file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temp_path)
+                .await?;
+            file.write_all(&encoded).await?;
+            file.sync_all().await?;
+            fs::rename(&temp_path, &path).await?;
+            sync_directory(state_dir).await?;
+            Ok::<_, std::io::Error>(())
+        }
+        .await;
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(error).with_context(|| format!("failed to write {}", path.display()));
+        }
+        Ok(())
     }
+}
+
+fn state_write_lock(path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut locks = locks
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(
+        locks
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
+#[cfg(unix)]
+async fn sync_directory(path: &Path) -> std::io::Result<()> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || std::fs::File::open(path)?.sync_all())
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+#[cfg(not(unix))]
+async fn sync_directory(_path: &Path) -> std::io::Result<()> {
+    Ok(())
 }
 
 fn state_path(state_dir: &Path) -> PathBuf {
@@ -245,5 +305,33 @@ mod tests {
         let error = StateSnapshot::load(temp.path()).await.unwrap_err();
 
         assert!(error.to_string().contains("failed to parse"));
+    }
+
+    #[tokio::test]
+    async fn atomic_save_does_not_allow_an_older_snapshot_to_replace_a_newer_one() {
+        let temp = tempfile::tempdir().unwrap();
+        let job_id = Uuid::new_v4();
+        let mut older = StateSnapshot::new(vec![(job_id, "job".to_string())]);
+        older.upsert(running_job_state(job_id, "job"));
+
+        let mut newer = older.clone();
+        let mut finished = running_job_state(job_id, "job");
+        finished.status = JobStatus::Succeeded;
+        finished.pid = None;
+        finished.finished_at = Some(Local::now());
+        newer.upsert(finished);
+
+        newer.save(temp.path()).await.unwrap();
+        older.save(temp.path()).await.unwrap();
+
+        let loaded = StateSnapshot::load(temp.path()).await.unwrap().unwrap();
+        assert_eq!(loaded.revision, newer.revision);
+        assert!(matches!(loaded.jobs[0].status, JobStatus::Succeeded));
+        let temp_files = std::fs::read_dir(temp.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(temp_files, 0);
     }
 }

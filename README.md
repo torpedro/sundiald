@@ -246,7 +246,9 @@ cargo run -- ui
 cargo run -- ui --once
 ```
 
-The `ui` command opens the interactive view by default, grouping jobs and services from named job files under their configured group names. Use `ui --once` to print one status frame and exit. In interactive mode, use arrow keys or `j`/`k` to select an entry, `Enter` to show the recent log file, `h` to show recent job history, `s` to show upcoming schedule details, `r` to run a job or start a service, `T` to send SIGTERM or stop a service, `K` to send SIGKILL, `R` to reload config, `Backspace` to clear details, and `q` to quit.
+The `ui` command opens the interactive view by default, grouping jobs and services from named job files under their configured group names. Use `ui --once` to print one status frame and exit. Selection is preserved by UUID across refreshes and reloads, and network requests run without blocking keyboard input or status updates.
+
+Use arrows or `j`/`k` to select an entry, with `Home`, `End`, `PgUp`, and `PgDn` for larger lists. `/` searches names, groups, and triggers; `f` cycles through all, running, failed, and unexpected views; `g` collapses the selected group and `G` expands all groups. `Enter`, `h`, `s`, and `i` select log, history, schedule, and summary details. `Tab` moves focus between the table and details, left/right changes detail tabs, and `F` follows the selected running log. Use `r` to run a job or start a service, `T` to send SIGTERM or stop a service, `K` to request a confirmed SIGKILL, `R` to reload config, `x` to dismiss the current notice or error, `Backspace` to return to summary, `?` for keyboard help, and `q` to quit.
 
 Job-control and history commands accept either a job name or a job UUID. UUIDs are stable across renames and are what the interactive UI uses internally.
 
@@ -266,6 +268,7 @@ curl -X POST http://127.0.0.1:8787/jobs/sleepy/kill
 curl -X POST http://127.0.0.1:8787/services/web/start
 curl -X POST http://127.0.0.1:8787/services/web/stop
 curl -X POST http://127.0.0.1:8787/services/web/kill
+curl http://127.0.0.1:8787/services/web/history
 curl 'http://127.0.0.1:8787/services/web/logs/latest?tail=40'
 curl -X POST http://127.0.0.1:8787/reload
 ```
@@ -274,4 +277,4 @@ The CLI uses this API for `ui`, `history`, job run/terminate/kill, service start
 
 `/status` reports `jobs` and `services`. Both use a `status` of `idle`, `running`, `succeeded`, `failed`, `start_failed`, or `interrupted`, plus `uuid`, `group`, `pid`, log path, exit code, and `terminated_by_signal` fields. Job rows include a `trigger` object and `next_runs` with up to 10 upcoming run times. Service rows include `schedule`, `next_start`, and `next_stop`.
 
-`/jobs/{job}/history?limit=50` returns recent SQLite run-history rows including trigger kind, start/finish times, duration, exit code, final status, error text, signal, group, and log path. `/jobs/{job}/logs/latest?tail=40` and `/services/{service}/logs/latest?tail=40` return recent stdout/stderr log content for the latest known run.
+`/jobs/{job}/history?limit=50` and `/services/{service}/history?limit=50` return recent SQLite run-history rows including trigger kind, start/finish times, duration, exit code, final status, error text, signal, group, and log path. `/jobs/{job}/logs/latest?tail=40` and `/services/{service}/logs/latest?tail=40` return recent stdout/stderr log content for the latest known run.

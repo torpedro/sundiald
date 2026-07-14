@@ -165,6 +165,7 @@ pub(crate) async fn run_api_on_listener(listener: TcpListener, state: ApiState) 
         .route("/services/{service}/start", post(api_start_service))
         .route("/services/{service}/stop", post(api_stop_service))
         .route("/services/{service}/kill", post(api_kill_service))
+        .route("/services/{service}/history", get(api_service_history))
         .route("/services/{service}/logs/latest", get(api_latest_log))
         .route("/reload", post(api_reload));
     let protected = if let Some(token) = token {
@@ -399,6 +400,37 @@ async fn api_job_history(
             StatusCode::OK,
             Json(HistoryResponse {
                 job: resolve_job_label(&api, uuid).await,
+                uuid,
+                runs,
+            }),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("{error:#}") })),
+        )
+            .into_response(),
+    }
+}
+
+async fn api_service_history(
+    State(api): State<ApiState>,
+    AxumPath(service): AxumPath<String>,
+    Query(query): Query<LimitQuery>,
+) -> Response {
+    let Some(uuid) = resolve_service_id(&api, &service).await else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": format!("unknown service '{service}'") })),
+        )
+            .into_response();
+    };
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    match api.history.runs_for_job(uuid, limit).await {
+        Ok(runs) => (
+            StatusCode::OK,
+            Json(HistoryResponse {
+                job: resolve_service_label(&api, uuid).await,
                 uuid,
                 runs,
             }),
@@ -1477,6 +1509,62 @@ mod tests {
         assert_eq!(history.uuid, job_id);
         assert_eq!(history.runs.len(), 1);
         assert_eq!(history.runs[0].status.as_deref(), Some("succeeded"));
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn api_exposes_service_history_endpoint_by_uuid() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = test_config(temp.path().to_path_buf());
+        let service = test_service("worker");
+        let service_id = service.uuid.unwrap();
+        config.services.push(service.clone());
+        let snapshot = StateSnapshot::new(vec![(service_id, "worker".to_string())]);
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let started_at = Local::now();
+        let run_id = history
+            .record_triggered(
+                &service.as_job_config(),
+                started_at,
+                "service_manual",
+                &temp.path().join("worker.log"),
+            )
+            .await
+            .unwrap();
+        history
+            .record_finished(
+                run_id,
+                started_at,
+                started_at + chrono::Duration::milliseconds(15),
+                Some(0),
+                "succeeded",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let mut api = test_api(config, snapshot);
+        api.history = history;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_api_on_listener(listener, api));
+
+        let history: HistoryResponse = reqwest::Client::new()
+            .get(format!(
+                "http://{addr}/services/{service_id}/history?limit=5"
+            ))
+            .send()
+            .await
+            .unwrap()
+            .error_for_status()
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        assert_eq!(history.uuid, service_id);
+        assert_eq!(history.job, "worker");
+        assert_eq!(history.runs.len(), 1);
         handle.abort();
     }
 

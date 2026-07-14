@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     fs,
+    fs::OpenOptions,
     net::TcpListener,
     sync::{Mutex, RwLock, mpsc},
 };
@@ -145,14 +146,13 @@ struct LimitQuery {
     tail: Option<usize>,
 }
 
-pub(crate) async fn run_api(bind: SocketAddr, state: ApiState) -> Result<()> {
-    let listener = TcpListener::bind(bind)
+pub(crate) async fn bind_api(bind: SocketAddr) -> Result<TcpListener> {
+    TcpListener::bind(bind)
         .await
-        .with_context(|| format!("failed to bind api on {bind}"))?;
-    run_api_on_listener(listener, state).await
+        .with_context(|| format!("failed to bind api on {bind}"))
 }
 
-async fn run_api_on_listener(listener: TcpListener, state: ApiState) -> Result<()> {
+pub(crate) async fn run_api_on_listener(listener: TcpListener, state: ApiState) -> Result<()> {
     let app = Router::new()
         .route("/health", get(|| async { Json(json!({ "ok": true })) }))
         .route("/status", get(api_status))
@@ -182,26 +182,10 @@ async fn api_status(State(api): State<ApiState>) -> Json<StatusResponse> {
 /// instead of just being logged, since this is now a synchronous,
 /// user-triggered action rather than a fire-and-forget signal.
 async fn api_reload(State(api): State<ApiState>) -> Response {
-    match SundialdConfig::load_and_ensure_ids(&api.config_path) {
-        Ok(mut new_config) => {
-            let runtime_base = match std::env::current_dir() {
-                Ok(path) => path,
-                Err(error) => {
-                    let message = format!("failed to resolve sundiald working directory: {error}");
-                    eprintln!("{message}");
-                    return (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({ "reloaded": false, "error": message })),
-                    )
-                        .into_response();
-                }
-            };
-            new_config.absolutize_runtime_paths(&runtime_base);
+    match prepare_reload_config(&api).await {
+        Ok(new_config) => {
             let job_count = new_config.jobs.len();
             let service_count = new_config.services.len();
-            let _ = fs::create_dir_all(&new_config.state_dir).await;
-            let _ = fs::create_dir_all(&new_config.log_dir).await;
-            let _ = fs::create_dir_all(&new_config.alert.event_dir).await;
             *api.config.write().await = new_config;
             eprintln!(
                 "sundiald config reloaded from {}",
@@ -230,6 +214,87 @@ async fn api_reload(State(api): State<ApiState>) -> Response {
                 .into_response()
         }
     }
+}
+
+async fn prepare_reload_config(api: &ApiState) -> Result<SundialdConfig> {
+    let runtime_base =
+        std::env::current_dir().context("failed to resolve sundiald working directory")?;
+    let current = api.config.read().await.clone();
+
+    // Validate restart-only fields and destinations before UUID generation can
+    // modify the source YAML. Reload the file afterward so the swapped config
+    // includes any generated IDs and catches a concurrent source-file change.
+    let mut candidate = SundialdConfig::load(&api.config_path)?;
+    candidate.absolutize_runtime_paths(&runtime_base);
+    validate_reload_compatibility(&current, &candidate)?;
+    prepare_reload_destinations(&candidate).await?;
+
+    let mut candidate = SundialdConfig::load_and_ensure_ids(&api.config_path)?;
+    candidate.absolutize_runtime_paths(&runtime_base);
+    validate_reload_compatibility(&current, &candidate)?;
+    prepare_reload_destinations(&candidate).await?;
+    Ok(candidate)
+}
+
+fn validate_reload_compatibility(
+    current: &SundialdConfig,
+    candidate: &SundialdConfig,
+) -> Result<()> {
+    if candidate.api_bind != current.api_bind {
+        anyhow::bail!(
+            "api_bind cannot be changed by reload (running={}, requested={}); restart sundiald",
+            current.api_bind,
+            candidate.api_bind
+        );
+    }
+    if candidate.state_dir != current.state_dir {
+        anyhow::bail!(
+            "state_dir cannot be changed by reload (running={}, requested={}); restart sundiald",
+            current.state_dir.display(),
+            candidate.state_dir.display()
+        );
+    }
+    Ok(())
+}
+
+async fn prepare_reload_destinations(config: &SundialdConfig) -> Result<()> {
+    probe_writable_directory(&config.log_dir, "log_dir").await?;
+    probe_writable_directory(&config.alert.event_dir, "alert.event_dir").await?;
+    probe_append_file(&config.service_log, "service_log").await?;
+    probe_append_file(&config.alert.log, "alert.log").await?;
+    Ok(())
+}
+
+async fn probe_writable_directory(path: &Path, label: &str) -> Result<()> {
+    fs::create_dir_all(path)
+        .await
+        .with_context(|| format!("failed to create {label} {}", path.display()))?;
+    let probe = path.join(format!(".sundiald-write-probe-{}", Uuid::new_v4()));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&probe)
+        .await
+        .with_context(|| format!("{label} is not writable: {}", path.display()))?;
+    fs::remove_file(&probe)
+        .await
+        .with_context(|| format!("failed to remove {label} write probe {}", probe.display()))?;
+    Ok(())
+}
+
+async fn probe_append_file(path: &Path, label: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await.with_context(|| {
+            format!("failed to create directory for {label} {}", path.display())
+        })?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await
+        .with_context(|| format!("{label} is not writable: {}", path.display()))?;
+    Ok(())
 }
 
 async fn api_run_job(State(api): State<ApiState>, AxumPath(job): AxumPath<String>) -> Response {
@@ -1632,5 +1697,92 @@ jobs:
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(api_config.read().await.jobs.len(), 1);
         handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_restart_only_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("sundiald.yaml");
+        tokio::fs::write(
+            &config_path,
+            format!(
+                "state_dir: {}\napi_bind: 127.0.0.1:8787\njobs: []\n",
+                temp.path().join("state").display()
+            ),
+        )
+        .await
+        .unwrap();
+        let config = SundialdConfig::load_and_ensure_ids(&config_path).unwrap();
+        let mut api = test_api(config, StateSnapshot::new(Vec::new()));
+        api.config_path = config_path.clone();
+
+        tokio::fs::write(
+            &config_path,
+            format!(
+                "state_dir: {}\napi_bind: 127.0.0.1:9999\njobs: []\n",
+                temp.path().join("state").display()
+            ),
+        )
+        .await
+        .unwrap();
+        let error = prepare_reload_config(&api).await.unwrap_err();
+        assert!(error.to_string().contains("api_bind cannot be changed"));
+
+        tokio::fs::write(
+            &config_path,
+            format!(
+                "state_dir: {}\napi_bind: 127.0.0.1:8787\njobs: []\n",
+                temp.path().join("other-state").display()
+            ),
+        )
+        .await
+        .unwrap();
+        let error = prepare_reload_config(&api).await.unwrap_err();
+        assert!(error.to_string().contains("state_dir cannot be changed"));
+    }
+
+    #[tokio::test]
+    async fn reload_rejects_unusable_output_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("sundiald.yaml");
+        let state_dir = temp.path().join("state");
+        tokio::fs::write(
+            &config_path,
+            format!(
+                "state_dir: {}\napi_bind: 127.0.0.1:8787\njobs: []\n",
+                state_dir.display()
+            ),
+        )
+        .await
+        .unwrap();
+        let config = SundialdConfig::load_and_ensure_ids(&config_path).unwrap();
+        let mut api = test_api(config, StateSnapshot::new(Vec::new()));
+        api.config_path = config_path.clone();
+
+        let blocker = temp.path().join("blocker");
+        tokio::fs::write(&blocker, "not a directory").await.unwrap();
+        tokio::fs::write(
+            &config_path,
+            format!(
+                "state_dir: {}\napi_bind: 127.0.0.1:8787\nlog_dir: {}/logs\njobs: []\n",
+                state_dir.display(),
+                blocker.display()
+            ),
+        )
+        .await
+        .unwrap();
+
+        let error = prepare_reload_config(&api).await.unwrap_err();
+        assert!(error.to_string().contains("failed to create log_dir"));
+    }
+
+    #[tokio::test]
+    async fn bind_api_reports_an_occupied_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let error = bind_api(address).await.unwrap_err();
+
+        assert!(error.to_string().contains("failed to bind api"));
     }
 }

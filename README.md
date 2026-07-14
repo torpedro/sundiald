@@ -151,7 +151,7 @@ Run history is recorded in a SQLite database at `state_dir/history.sqlite3`. Eac
 cargo run -- reload
 ```
 
-Reloads the config from disk without restarting — this picks up job/schedule/log/alert changes. The config is validated before being swapped in; an invalid file is rejected and the service keeps running on its previous config. Changing `api_bind` still requires a full restart, since it means rebinding the HTTP listener.
+Reloads the config from disk without restarting — this picks up job/schedule/log/alert changes. The config and its output destinations are validated before being swapped in; an invalid or unusable configuration is rejected and the service keeps running on its previous config. Changing `api_bind` or `state_dir` requires a full restart because the listener and history database are initialized at daemon startup.
 
 When the daemon shuts down, it sends SIGTERM to running jobs and services, waits up to `shutdown_grace_period` for jobs and up to each service's `stop_grace_period` when set, then escalates any remaining process groups to SIGKILL. This lets stdout/stderr logs, state, and SQLite history finish cleanly before the daemon exits.
 

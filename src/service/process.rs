@@ -403,22 +403,33 @@ async fn run_job_inner(
     )
     .await;
 
-    let stdout = child
-        .stdout
-        .take()
-        .context("child stdout was not captured")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("child stderr was not captured")?;
-    let stdout_task = tokio::spawn(copy_stream(stdout, stdout_log_path.clone()));
-    let stderr_task = tokio::spawn(copy_stream_lazy(stderr, stderr_log_path.clone()));
+    let mut internal_errors = Vec::new();
+    let stdout_task = match child.stdout.take() {
+        Some(stdout) => Some((
+            "stdout",
+            tokio::spawn(copy_stream(stdout, stdout_log_path.clone())),
+        )),
+        None => {
+            internal_errors.push("child stdout was not captured".to_string());
+            None
+        }
+    };
+    let stderr_task = match child.stderr.take() {
+        Some(stderr) => Some((
+            "stderr",
+            tokio::spawn(copy_stream_lazy(stderr, stderr_log_path.clone())),
+        )),
+        None => {
+            internal_errors.push("child stderr was not captured".to_string());
+            None
+        }
+    };
 
     let alert_threshold = job.alert_threshold();
     let mut overrun_alerted = false;
     let mut terminated_by = None;
     let mut expected_stop = false;
-    let status = loop {
+    let status_result = loop {
         let overrun_sleep = async {
             match alert_threshold {
                 Some(duration) if !overrun_alerted => time::sleep(duration).await,
@@ -427,29 +438,37 @@ async fn run_job_inner(
         };
 
         tokio::select! {
-            status = child.wait() => break status?,
+            status = child.wait() => break status,
             command = control_rx.recv() => {
                 if let Some(JobControl::Signal { kind: signal, expected }) = command {
                     terminated_by = Some(signal);
                     expected_stop |= expected;
                     if let Some(pid) = pid {
-                        send_signal(pid, signal)?;
-                        super::log_service_event(
-                            &service_log,
-                            format!(
-                                "{} job_signal_sent job={} pid={} signal={}{}",
-                                Local::now().to_rfc3339(),
-                                job.name,
-                                pid,
-                                signal.name(),
-                                trigger.log_suffix()
-                            ),
-                            emit_stdout,
-                        )
-                        .await;
+                        match send_signal(pid, signal) {
+                            Ok(()) => {
+                                super::log_service_event(
+                                    &service_log,
+                                    format!(
+                                        "{} job_signal_sent job={} pid={} signal={}{}",
+                                        Local::now().to_rfc3339(),
+                                        job.name,
+                                        pid,
+                                        signal.name(),
+                                        trigger.log_suffix()
+                                    ),
+                                    emit_stdout,
+                                )
+                                .await;
+                            }
+                            Err(error) if process_is_missing(&error) => {}
+                            Err(error) => internal_errors.push(format!(
+                                "failed to send {} to process group {pid}: {error:#}",
+                                signal.name()
+                            )),
+                        }
                     }
                 } else {
-                    break child.wait().await?;
+                    break child.wait().await;
                 }
             }
             _ = overrun_sleep => {
@@ -468,30 +487,74 @@ async fn run_job_inner(
             }
         }
     };
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
+    let status = match status_result {
+        Ok(status) => Some(status),
+        Err(error) => {
+            internal_errors.push(format!("failed to wait for child process: {error}"));
+            if let Some(pid) = pid
+                && let Err(error) = send_signal(pid, SignalKind::Kill)
+                && !process_is_missing(&error)
+            {
+                internal_errors.push(format!(
+                    "failed to kill process group {pid} after wait error: {error:#}"
+                ));
+            }
+            match time::timeout(std::time::Duration::from_secs(5), child.wait()).await {
+                Ok(Ok(status)) => Some(status),
+                Ok(Err(error)) => {
+                    internal_errors.push(format!("failed to reap child process: {error}"));
+                    None
+                }
+                Err(_) => {
+                    internal_errors.push(
+                        "timed out reaping child process after forced termination".to_string(),
+                    );
+                    None
+                }
+            }
+        }
+    };
+
+    for stream_task in [stdout_task, stderr_task].into_iter().flatten() {
+        let (stream, task) = stream_task;
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                internal_errors.push(format!("failed to capture child {stream}: {error:#}"));
+            }
+            Err(error) => {
+                internal_errors.push(format!("child {stream} capture task failed: {error}"));
+            }
+        }
+    }
 
     let finished_at = Local::now();
-    let exit_code = status.code();
-    let success = status.success();
+    let exit_code = status.as_ref().and_then(|status| status.code());
+    let process_success = status.as_ref().is_some_and(|status| status.success());
+    let internal_error = (!internal_errors.is_empty()).then(|| internal_errors.join("; "));
     let unexpected_service_exit = matches!(process_kind, ProcessKind::Service) && !expected_stop;
     let expected_service_stop = matches!(process_kind, ProcessKind::Service) && expected_stop;
-    let status_kind = if expected_service_stop {
+    let status_kind = if internal_error.is_some() {
+        JobStatus::Failed
+    } else if expected_service_stop {
         JobStatus::Succeeded
     } else if unexpected_service_exit {
         JobStatus::Failed
-    } else if success {
+    } else if process_success {
         JobStatus::Succeeded
     } else {
         JobStatus::Failed
     };
+    let final_success = matches!(status_kind, JobStatus::Succeeded);
     let history_status = status_kind.to_string();
     let history_signal = terminated_by.map(|signal| signal.name());
-    let last_error = if expected_service_stop {
+    let last_error = if let Some(error) = internal_error {
+        Some(format!("job runner internal error: {error}"))
+    } else if expected_service_stop {
         None
-    } else if unexpected_service_exit && success {
+    } else if unexpected_service_exit && process_success {
         Some("service exited unexpectedly".to_string())
-    } else if success {
+    } else if process_success {
         None
     } else if let Some(signal) = history_signal {
         Some(format!("terminated by {signal}"))
@@ -537,7 +600,7 @@ async fn run_job_inner(
             exit_code
                 .map(|code| code.to_string())
                 .unwrap_or_else(|| "signal".to_string()),
-            success,
+            final_success,
             stdout_log_path.display(),
             stderr_log_path.display(),
             terminated_by
@@ -555,8 +618,23 @@ async fn run_job_inner(
 
     Ok(JobCompletion {
         name: job.name,
-        success,
+        success: final_success,
     })
+}
+
+#[cfg(unix)]
+fn process_is_missing(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::raw_os_error)
+            == Some(libc::ESRCH)
+    })
+}
+
+#[cfg(not(unix))]
+fn process_is_missing(_error: &anyhow::Error) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -869,6 +947,71 @@ mod tests {
             tokio::fs::read_to_string(stderr_path).await.unwrap(),
             "err\n"
         );
+    }
+
+    #[tokio::test]
+    async fn log_capture_failure_finalizes_state_and_history_as_failed() {
+        let temp = tempfile::tempdir().unwrap();
+        let alert = AlertConfig {
+            log: temp.path().join("alerts.log"),
+            event_dir: temp.path().join("alerts"),
+            retention_days: 0,
+            command: None,
+            pushover: None,
+        };
+        let job_id = Uuid::new_v4();
+        let job = JobConfig {
+            uuid: Some(job_id),
+            name: "broken-log".to_string(),
+            command: "printf 'output\\n'".to_string(),
+            trigger: JobTrigger::Manual,
+            alert_if_running_for_longer_than: None,
+            group: None,
+            env: HashMap::new(),
+            source_path: None,
+        };
+        let history = HistoryDb::open(temp.path()).await.unwrap();
+        let log_dir = temp.path().join("not-a-directory");
+        tokio::fs::write(&log_dir, "blocking file").await.unwrap();
+        let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
+        let (_control_tx, control_rx) = mpsc::unbounded_channel();
+
+        let completion = run_job_inner(
+            job,
+            log_dir,
+            temp.path().join("sundiald.log"),
+            alert.clone(),
+            temp.path().to_path_buf(),
+            history.clone(),
+            Arc::clone(&state),
+            control_rx,
+            false,
+            RunTrigger::Manual,
+            ProcessKind::Job,
+        )
+        .await
+        .unwrap();
+
+        assert!(!completion.success);
+        let snapshot = state.lock().await;
+        let job_state = snapshot
+            .jobs
+            .iter()
+            .find(|job| job.uuid == job_id)
+            .expect("failed job state should be persisted");
+        assert!(matches!(job_state.status, JobStatus::Failed));
+        assert!(
+            job_state
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("failed to capture child stdout"))
+        );
+        drop(snapshot);
+
+        let runs = history.runs_for_job(job_id, 1).await.unwrap();
+        assert_eq!(runs[0].status.as_deref(), Some("failed"));
+        assert!(runs[0].finished_at.is_some());
+        assert!(alert.event_dir.exists());
     }
 
     #[tokio::test]

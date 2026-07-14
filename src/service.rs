@@ -96,6 +96,7 @@ pub(crate) async fn log_service_event(service_log: &PathBuf, line: String, emit_
 }
 
 pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()> {
+    let mut shutdown_signals = ShutdownSignals::new()?;
     let runtime_base =
         std::env::current_dir().context("failed to resolve sundiald working directory")?;
     config.absolutize_runtime_paths(&runtime_base);
@@ -143,7 +144,8 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
         running_controls: Arc::clone(&running_controls),
         history: history.clone(),
     };
-    let api_handle = tokio::spawn(api::run_api(api_bind, api_state));
+    let api_listener = api::bind_api(api_bind).await?;
+    let mut api_handle = tokio::spawn(api::run_api_on_listener(api_listener, api_state));
 
     let mut running: HashMap<Uuid, RunningJob> = HashMap::new();
     let mut running_services: HashMap<Uuid, RunningJob> = HashMap::new();
@@ -157,16 +159,31 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
     eprintln!("sundiald service started with {job_count} job(s)");
     eprintln!("sundiald api listening on http://{api_bind}");
 
+    let mut daemon_error = None;
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                eprintln!("sundiald service stopping");
+            signal = shutdown_signals.recv() => {
+                match signal {
+                    Ok(signal) => eprintln!("sundiald service stopping after {signal}"),
+                    Err(error) => daemon_error = Some(error),
+                }
+                break;
+            }
+            api_result = &mut api_handle => {
+                daemon_error = Some(match api_result {
+                    Ok(Ok(())) => anyhow::anyhow!("sundiald api stopped unexpectedly"),
+                    Ok(Err(error)) => error.context("sundiald api stopped unexpectedly"),
+                    Err(error) => anyhow::anyhow!("sundiald api task failed: {error}"),
+                });
                 break;
             }
             Some(job_name) = manual_rx.recv() => {
                 retain_running(&mut running);
                 let current_config = config.read().await.clone();
-                handle_manual_request(&current_config, &mut running, history.clone(), Arc::clone(&state), Arc::clone(&pending_manual), Arc::clone(&running_controls), completion_tx.clone(), job_name).await?;
+                if let Err(error) = handle_manual_request(&current_config, &mut running, history.clone(), Arc::clone(&state), Arc::clone(&pending_manual), Arc::clone(&running_controls), completion_tx.clone(), job_name).await {
+                    daemon_error = Some(error.context("failed to handle manual job request"));
+                    break;
+                }
             }
             Some(command) = service_rx.recv() => {
                 retain_running(&mut running_services);
@@ -270,11 +287,61 @@ pub async fn run(mut config: SundialdConfig, config_path: PathBuf) -> Result<()>
         }
     }
 
-    api_handle.abort();
+    if !api_handle.is_finished() {
+        api_handle.abort();
+        let _ = api_handle.await;
+    }
     let shutdown_config = config.read().await.clone();
     graceful_shutdown_running(running, running_services, &shutdown_config).await;
 
-    Ok(())
+    match daemon_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
+}
+
+#[cfg(unix)]
+struct ShutdownSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind as UnixSignalKind, signal};
+
+        Ok(Self {
+            interrupt: signal(UnixSignalKind::interrupt())
+                .context("failed to install SIGINT handler")?,
+            terminate: signal(UnixSignalKind::terminate())
+                .context("failed to install SIGTERM handler")?,
+        })
+    }
+
+    async fn recv(&mut self) -> Result<&'static str> {
+        tokio::select! {
+            _ = self.interrupt.recv() => Ok("SIGINT"),
+            _ = self.terminate.recv() => Ok("SIGTERM"),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ShutdownSignals;
+
+#[cfg(not(unix))]
+impl ShutdownSignals {
+    fn new() -> Result<Self> {
+        Ok(Self)
+    }
+
+    async fn recv(&mut self) -> Result<&'static str> {
+        tokio::signal::ctrl_c()
+            .await
+            .context("failed to listen for interrupt signal")?;
+        Ok("interrupt signal")
+    }
 }
 
 struct ShutdownTarget {

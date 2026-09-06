@@ -258,15 +258,16 @@ impl UiState {
         self.detail_log = None;
         self.detail_history = None;
         self.detail_scroll = 0;
-        self.focus = if mode == DetailMode::Summary {
-            Focus::Table
-        } else {
-            Focus::Details
-        };
+    }
+
+    fn open_detail_mode(&mut self, mode: DetailMode) {
+        self.set_detail_mode(mode);
+        self.focus = Focus::Details;
     }
 
     fn clear_details(&mut self) {
         self.set_detail_mode(DetailMode::Summary);
+        self.focus = Focus::Table;
     }
 
     fn entry_visible(&self, entry: &UiEntry) -> bool {
@@ -437,8 +438,11 @@ fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('q') | KeyCode::Esc => return true,
+        KeyCode::Char('q') => return true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return true,
+        KeyCode::Esc => {
+            state.clear_details();
+        }
         KeyCode::Down | KeyCode::Char('j') => {
             if state.focus == Focus::Details {
                 state.detail_scroll = state.detail_scroll.saturating_add(1);
@@ -477,11 +481,10 @@ fn handle_key(
                 selection_changed(config, state, event_tx);
             }
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::BackTab => {
             state.focus = match state.focus {
-                Focus::Table if state.detail_mode != DetailMode::Summary => Focus::Details,
+                Focus::Table => Focus::Details,
                 Focus::Details => Focus::Table,
-                Focus::Table => Focus::Table,
             };
         }
         KeyCode::Left if state.focus == Focus::Details => {
@@ -525,7 +528,7 @@ fn handle_key(
                 );
             }
         }
-        KeyCode::Char('T') => {
+        KeyCode::Char('S') => {
             if let Some((kind, uuid, name)) = state.selected_action_target() {
                 if state
                     .selected_entry()
@@ -583,14 +586,14 @@ fn handle_key(
             }
         }
         KeyCode::Char('s') => {
-            state.set_detail_mode(DetailMode::Schedule);
+            state.open_detail_mode(DetailMode::Schedule);
         }
         KeyCode::Char('h') => {
-            state.set_detail_mode(DetailMode::History);
+            state.open_detail_mode(DetailMode::History);
             request_selected_detail(config, state, event_tx);
         }
         KeyCode::Enter => {
-            state.set_detail_mode(DetailMode::Log);
+            state.open_detail_mode(DetailMode::Log);
             request_selected_detail(config, state, event_tx);
         }
         KeyCode::Char('i') => state.clear_details(),
@@ -1021,7 +1024,12 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     };
     let table = Table::new(rows, constraints)
         .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(title)
+                .borders(Borders::ALL)
+                .border_style(focus_border_style(state.focus == Focus::Table)),
+        )
         .row_highlight_style(Style::default().bg(Color::Indexed(236)))
         .highlight_symbol("> ");
 
@@ -1157,14 +1165,10 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .selected_entry()
         .map(|entry| entry.name.as_str())
         .unwrap_or("No selection");
-    let focus = if state.focus == Focus::Details {
-        " · focused"
-    } else {
-        ""
-    };
     let block = Block::default()
-        .title(format!("Details · {name}{focus}"))
-        .borders(Borders::ALL);
+        .title(format!("Details · {name}"))
+        .borders(Borders::ALL)
+        .border_style(focus_border_style(state.focus == Focus::Details));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.height == 0 {
@@ -1339,18 +1343,16 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
             state.search
         )
     } else if area.width < 90 {
-        "? help  / find  f filter  Enter log  r start  T stop  q quit".to_string()
+        "? help  r start  S stop  q quit".to_string()
     } else {
         let actions = state.selected_entry().map_or("", |entry| {
             if matches!(entry.status, state::JobStatus::Running) {
-                "T stop  K kill"
+                "S stop  K kill"
             } else {
                 "r run/start"
             }
         });
-        format!(
-            "? help  / search  f filter  g group  Enter log  h history  s schedule  {actions}  R reload  x dismiss  q quit"
-        )
+        format!("? help  {actions}  R reload  x dismiss  q quit")
     };
     frame.render_widget(
         Paragraph::new(text).style(Style::default().fg(Color::Gray)),
@@ -1412,11 +1414,11 @@ fn draw_help(frame: &mut Frame<'_>) {
         "Find and filter   / search, f cycle filter, g collapse, G expand all",
         "Details           i summary, Enter log, h history, s schedule",
         "Logs              F toggles automatic follow",
-        "Actions           r run/start, T terminate/stop, K force kill",
+        "Actions           r run/start, S terminate/stop, K force kill",
         "Configuration     R reload",
         "Messages          x dismisses the current notice or error",
-        "Close details     Backspace",
-        "Quit              q, Esc, Ctrl-C",
+        "Close details     Backspace, Esc",
+        "Quit              q, Ctrl-C",
         "",
         "Press any key to close help.",
     ]
@@ -1475,6 +1477,16 @@ fn compact_status(entry: &UiEntry) -> String {
     }
 
     parts.join(" ")
+}
+
+fn focus_border_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 fn status_cell(entry: &UiEntry) -> Cell<'static> {

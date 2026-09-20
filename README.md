@@ -1,5 +1,4 @@
 # sundiald
-# sundiald
 
 `sundiald` is a small Rust job and service runner. It reads a YAML config, starts shell commands on schedules or by request, captures stdout/stderr to disk, records state for inspection, logs lifecycle events to stdout and its own log file, and writes alerts for failed jobs or unexpected service exits.
 

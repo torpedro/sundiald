@@ -3,14 +3,12 @@
 #
 # Shows the current version, prompts for the next one, updates every file that
 # records it, then optionally updates the changelog, commits, verifies and publishes
-# to crates.io, and tags. Every step is a prompt, and nothing is pushed or published
-# without one; see docs/releases.md.
+# to crates.io, tags, and pushes the tag. Every step is a prompt, and nothing is
+# committed, pushed or published without one; see docs/releases.md.
 
 set -euo pipefail
 
-PROJECT_NAME="sundiald"
-# Used for both the release commit subject and the tag message.
-RELEASE_NAME="sundiald"
+APP_NAME="sundiald"
 PUBLISH_WARNING="This uploads sundiald to crates.io. Published versions are permanent:
 they cannot be replaced or deleted, only yanked."
 
@@ -58,7 +56,7 @@ git rev-parse --git-dir >/dev/null 2>&1 || die "not a git repository"
 current=$(current_version)
 [ -n "$current" ] || die "could not read the package version from Cargo.toml"
 
-printf '\n%s release\n\n  Current version: %s\n\n' "$PROJECT_NAME" "$current"
+printf '\n%s release\n\n  Current version: %s\n\n' "$APP_NAME" "$current"
 printf '  1) patch   %s\n' "$(bump "$current" patch)"
 printf '  2) minor   %s\n' "$(bump "$current" minor)"
 printf '  3) major   %s\n' "$(bump "$current" major)"
@@ -108,9 +106,9 @@ printf '\nChanged files:\n\n'
 git status --short
 printf '\n'
 
-if confirm "Commit as \"$RELEASE_NAME $target\"?"; then
+if confirm "Commit as \"$APP_NAME $target\"?"; then
     git add -A
-    git commit -q -m "$RELEASE_NAME $target"
+    git commit -q -m "$APP_NAME $target"
     printf 'Committed %s\n' "$(git rev-parse --short HEAD)"
 else
     printf 'Left uncommitted. A tag would not include these changes.\n'
@@ -135,10 +133,10 @@ else
     fi
 
     printf '\n%s\n' "$PUBLISH_WARNING"
-    if confirm "Publish $RELEASE_NAME $target to crates.io?"; then
+    if confirm "Publish $APP_NAME $target to crates.io?"; then
         cargo publish --workspace --locked --registry crates-io
         published=1
-        printf '\nPublished %s %s.\n' "$RELEASE_NAME" "$target"
+        printf '\nPublished %s %s.\n' "$APP_NAME" "$target"
     else
         printf '\nNot published. Resume at docs/releases.md step 4.\n'
     fi
@@ -149,15 +147,28 @@ if [ "$published" -eq 0 ]; then
     printf 'registry. The documented order is publish first, then tag.\n\n'
 fi
 
+# The branch's own remote, so the tag follows the commit it names.
+remote=$(git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null | cut -d/ -f1) || remote=""
+[ -n "$remote" ] || remote=origin
+
 if confirm "Create tag $tag?"; then
-    git tag -a "$tag" -m "$RELEASE_NAME $target"
-    printf '\nCreated %s locally. It is not pushed.\n' "$tag"
-    printf '  push:   git push origin %s\n' "$tag"
-    printf '  undo:   git tag -d %s\n' "$tag"
+    git tag -a "$tag" -m "$APP_NAME $target"
+    printf '\nCreated %s locally.\n' "$tag"
+
+    if confirm "Push $tag to $remote?"; then
+        git push "$remote" "$tag"
+        printf '\nPushed %s to %s. Do not move it: each tag should keep identifying\n' \
+            "$tag" "$remote"
+        printf 'the source that was published.\n'
+    else
+        printf '\nNot pushed.\n'
+        printf '  push:   git push %s %s\n' "$remote" "$tag"
+        printf '  undo:   git tag -d %s\n' "$tag"
+    fi
 else
     printf '\nNo tag created. After publishing:\n'
-    printf '  git tag -a %s -m "%s %s" && git push origin %s\n' \
-        "$tag" "$RELEASE_NAME" "$target" "$tag"
+    printf '  git tag -a %s -m "%s %s" && git push %s %s\n' \
+        "$tag" "$APP_NAME" "$target" "$remote" "$tag"
 fi
 
 printf '\nNext: docs/releases.md, from the first step this run did not cover.\n\n'

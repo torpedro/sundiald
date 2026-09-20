@@ -114,7 +114,8 @@ and [publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html
 
 ## 5. Tag and announce
 
-After confirming publication, tag the same commit:
+`make_release.sh` offers the tag and its push at the end of a run. To do it by
+hand, after confirming publication, tag the same commit:
 
 ```sh
 git tag -a v0.1.1 -m "sundiald 0.1.1"

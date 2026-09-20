@@ -18,6 +18,8 @@ For the commands below, replace `cargo run --` with `sundiald` when using the in
 cargo build
 ```
 
+See [RELEASING.md](RELEASING.md) for the versioning and publishing process.
+
 ## Example config
 
 Generate a starter config:

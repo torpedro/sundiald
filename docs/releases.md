@@ -5,6 +5,10 @@ commands below from the repository root. Examples use `0.1.1`; substitute the
 version being released throughout. For the first release, keep `0.1.0` if it has
 not already been published.
 
+sundiald depends on `flares-client` from crates.io. If this release needs client
+behavior that is not yet published, release [flares](https://github.com/torpedro/flares)
+first and update the dependency version here before continuing.
+
 ## One-time setup
 
 Sign in to [crates.io](https://crates.io), verify your email, and create an
@@ -39,8 +43,9 @@ state when assessing compatibility. Document migration steps for breaking change
 ## 2. Prepare and test
 
 Start from the intended release branch with unrelated changes committed or set
-aside. Update the README and examples for any changed behavior, and prepare release
-notes summarizing fixes, features, and migration steps.
+aside. Update the README and examples for any changed behavior. In `CHANGELOG.md`,
+move the `## Unreleased` entries under a new version heading; those entries become
+the release notes. Document migration steps for breaking changes there.
 
 After editing the version, refresh the app's lockfile entry and run checks:
 
@@ -59,7 +64,7 @@ Stage `Cargo.toml`, `Cargo.lock`, and any release documentation changes explicit
 then commit:
 
 ```sh
-git add Cargo.toml Cargo.lock
+git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "Release 0.1.1"
 git status --short
 ```
@@ -104,8 +109,13 @@ git tag -a v0.1.1 -m "Release 0.1.1"
 git push origin v0.1.1
 ```
 
-Create a GitHub release for that tag using the prepared release notes, including
-any migration steps. Check installation of the published version:
+Create a GitHub release for that tag, using the changelog entries for this version
+as its description and including any migration steps.
+
+## 6. Verify the public installation
+
+Install from crates.io in a fresh directory, so the source checkout cannot mask
+missing files:
 
 ```sh
 cargo install sundiald --version '=0.1.1' --locked

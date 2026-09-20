@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{self, IsTerminal},
     thread,
 };
@@ -172,15 +172,16 @@ impl UiEntry {
 #[derive(Debug, Clone)]
 enum MouseTarget {
     Pane(Focus),
+    List(EntryKind),
     Entry(uuid::Uuid),
-    Group(EntryKind, String),
     Tab(DetailMode),
 }
 
 #[derive(Debug)]
 struct UiState {
     selected_uuid: Option<uuid::Uuid>,
-    sidebar_state: ListState,
+    jobs_state: ListState,
+    services_state: ListState,
     mouse_targets: Vec<(Rect, MouseTarget)>,
     entries: Vec<UiEntry>,
     message: String,
@@ -190,7 +191,6 @@ struct UiState {
     status_pending: bool,
     pending_actions: HashMap<uuid::Uuid, String>,
     reload_pending: bool,
-    collapsed_groups: HashSet<(EntryKind, String)>,
     input_mode: InputMode,
     focus: Focus,
     detail_mode: DetailMode,
@@ -207,7 +207,8 @@ impl UiState {
     fn new() -> Self {
         Self {
             selected_uuid: None,
-            sidebar_state: ListState::default(),
+            jobs_state: ListState::default(),
+            services_state: ListState::default(),
             mouse_targets: Vec::new(),
             entries: Vec::new(),
             message: "connecting".to_string(),
@@ -217,7 +218,6 @@ impl UiState {
             status_pending: false,
             pending_actions: HashMap::new(),
             reload_pending: false,
-            collapsed_groups: HashSet::new(),
             input_mode: InputMode::Normal,
             focus: Focus::Sidebar,
             detail_mode: DetailMode::Summary,
@@ -261,19 +261,19 @@ impl UiState {
         self.focus = Focus::Sidebar;
     }
 
-    fn group_collapsed(&self, entry: &UiEntry) -> bool {
-        entry
-            .group
-            .as_ref()
-            .is_some_and(|group| self.collapsed_groups.contains(&(entry.kind, group.clone())))
-    }
-
     fn visible_ids(&self) -> Vec<uuid::Uuid> {
         [EntryKind::Job, EntryKind::Service]
             .into_iter()
             .flat_map(|kind| group_entries(self, kind))
             .flat_map(|(_, entries)| entries)
-            .filter(|entry| !self.group_collapsed(entry))
+            .map(|entry| entry.uuid)
+            .collect()
+    }
+
+    fn visible_ids_for(&self, kind: EntryKind) -> Vec<uuid::Uuid> {
+        group_entries(self, kind)
+            .into_iter()
+            .flat_map(|(_, entries)| entries)
             .map(|entry| entry.uuid)
             .collect()
     }
@@ -394,27 +394,25 @@ fn handle_mouse(
     };
     let focus = match &target {
         MouseTarget::Pane(focus) => *focus,
-        MouseTarget::Entry(_) | MouseTarget::Group(_, _) => Focus::Sidebar,
+        MouseTarget::List(_) | MouseTarget::Entry(_) => Focus::Sidebar,
         MouseTarget::Tab(_) => Focus::Details,
     };
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             state.focus = focus;
             match target {
+                MouseTarget::List(kind) => {
+                    if state
+                        .selected_entry()
+                        .is_none_or(|entry| entry.kind != kind)
+                    {
+                        state.selected_uuid = state.visible_ids_for(kind).first().copied();
+                        selection_changed(config, state, event_tx);
+                    }
+                }
                 MouseTarget::Entry(uuid) if state.selected_uuid != Some(uuid) => {
                     state.selected_uuid = Some(uuid);
                     selection_changed(config, state, event_tx);
-                }
-                MouseTarget::Group(kind, group) => {
-                    let key = (kind, group);
-                    if !state.collapsed_groups.remove(&key) {
-                        state.collapsed_groups.insert(key);
-                    }
-                    let previous = state.selected_uuid;
-                    state.reconcile_selection();
-                    if state.selected_uuid != previous {
-                        selection_changed(config, state, event_tx);
-                    }
                 }
                 MouseTarget::Tab(mode) if state.detail_mode != mode => {
                     state.set_detail_mode(mode);
@@ -426,8 +424,32 @@ fn handle_mouse(
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
             let down = mouse.kind == MouseEventKind::ScrollDown;
             if focus == Focus::Sidebar {
-                if state.move_selection(if down { 3 } else { -3 }) {
-                    selection_changed(config, state, event_tx);
+                let kind = state.mouse_targets.iter().find_map(|(area, target)| {
+                    if area.contains(position)
+                        && let MouseTarget::List(kind) = target
+                    {
+                        Some(*kind)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(kind) = kind {
+                    let ids = state.visible_ids_for(kind);
+                    if !ids.is_empty() {
+                        let next = state
+                            .selected_uuid
+                            .and_then(|uuid| ids.iter().position(|id| *id == uuid))
+                            .map(|index| {
+                                (index as isize + if down { 3 } else { -3 })
+                                    .clamp(0, ids.len() as isize - 1)
+                                    as usize
+                            })
+                            .unwrap_or(0);
+                        if state.selected_uuid != Some(ids[next]) {
+                            state.selected_uuid = Some(ids[next]);
+                            selection_changed(config, state, event_tx);
+                        }
+                    }
                 }
             } else if down {
                 state.detail_scroll = state.detail_scroll.saturating_add(3);
@@ -643,23 +665,6 @@ fn handle_key(
                 "log follow disabled".to_string()
             };
             state.message_expires_at = Some(time::Instant::now() + Duration::from_secs(3));
-        }
-        KeyCode::Char('g') => {
-            if let Some(entry) = state.selected_entry()
-                && let Some(group) = &entry.group
-            {
-                let key = (entry.kind, group.clone());
-                if !state.collapsed_groups.remove(&key) {
-                    state.collapsed_groups.insert(key);
-                }
-                state.reconcile_selection();
-                selection_changed(config, state, event_tx);
-            }
-        }
-        KeyCode::Char('G') => {
-            state.collapsed_groups.clear();
-            state.reconcile_selection();
-            selection_changed(config, state, event_tx);
         }
         KeyCode::Char('?') => {
             state.input_mode = InputMode::Help;
@@ -960,84 +965,92 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &ClientConfig, state: 
 }
 
 fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
+    let panes =
+        Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)]).split(area);
+    draw_entry_list(frame, panes[0], state, EntryKind::Job, "Jobs");
+    draw_entry_list(frame, panes[1], state, EntryKind::Service, "Services");
+}
+
+fn draw_entry_list(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &mut UiState,
+    kind: EntryKind,
+    title: &str,
+) {
     let mut items = Vec::new();
     let mut selected = None;
     let mut row_targets = Vec::new();
-    state
-        .mouse_targets
-        .push((area, MouseTarget::Pane(Focus::Sidebar)));
-    for (kind, title) in [(EntryKind::Job, "Jobs"), (EntryKind::Service, "Services")] {
-        if kind == EntryKind::Service {
-            items.push(ListItem::new(""));
+    state.mouse_targets.push((area, MouseTarget::List(kind)));
+    let groups = group_entries(state, kind);
+    let count: usize = groups.iter().map(|(_, entries)| entries.len()).sum();
+    if groups.is_empty() {
+        items.push(ListItem::new("  No entries").style(Style::default().fg(MUTED)));
+    }
+    for (group, entries) in groups {
+        if let Some(group) = &group {
+            items.push(ListItem::new(format!("  {group}")).style(Style::default().fg(MUTED)));
         }
-        let groups = group_entries(state, kind);
-        let count: usize = groups.iter().map(|(_, entries)| entries.len()).sum();
-        items.push(
-            ListItem::new(format!("{title} · {count}"))
-                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-        );
-        if groups.is_empty() {
-            items.push(ListItem::new("  No entries").style(Style::default().fg(MUTED)));
-        }
-        for (group, entries) in groups {
-            let collapsed = entries
-                .first()
-                .is_some_and(|entry| state.group_collapsed(entry));
-            if let Some(group) = &group {
-                row_targets.push((items.len(), MouseTarget::Group(kind, group.clone())));
-                items.push(
-                    ListItem::new(format!("{} {group}", if collapsed { "▸" } else { "▾" }))
-                        .style(Style::default().fg(MUTED)),
-                );
+        for entry in entries {
+            row_targets.push((items.len(), MouseTarget::Entry(entry.uuid)));
+            if state.selected_uuid == Some(entry.uuid) {
+                selected = Some(items.len());
             }
-            if collapsed {
-                continue;
-            }
-            for entry in entries {
-                row_targets.push((items.len(), MouseTarget::Entry(entry.uuid)));
-                if state.selected_uuid == Some(entry.uuid) {
-                    selected = Some(items.len());
+            let pending = state.pending_actions.contains_key(&entry.uuid) || entry.manual_pending;
+            let symbol = if pending {
+                "…"
+            } else {
+                match entry.status {
+                    state::JobStatus::Running => "●",
+                    state::JobStatus::Succeeded => "✓",
+                    state::JobStatus::Failed | state::JobStatus::StartFailed => "×",
+                    state::JobStatus::Interrupted => "!",
+                    state::JobStatus::Idle => "○",
                 }
-                let pending =
-                    state.pending_actions.contains_key(&entry.uuid) || entry.manual_pending;
-                let symbol = if pending {
-                    "…"
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::raw(if state.selected_uuid == Some(entry.uuid) {
+                    "> "
                 } else {
-                    match entry.status {
-                        state::JobStatus::Running => "●",
-                        state::JobStatus::Succeeded => "✓",
-                        state::JobStatus::Failed | state::JobStatus::StartFailed => "×",
-                        state::JobStatus::Interrupted => "!",
-                        state::JobStatus::Idle => "○",
-                    }
-                };
-                items.push(ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{symbol} "),
-                        if pending {
-                            Style::default().fg(Color::Yellow)
-                        } else {
-                            status_style(entry)
-                        },
-                    ),
-                    Span::raw(entry.name.clone()),
-                ])));
-            }
+                    "  "
+                }),
+                Span::styled(
+                    format!("{symbol} "),
+                    if pending {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        status_style(entry)
+                    },
+                ),
+                Span::raw(entry.name.clone()),
+            ])));
         }
     }
     let list = List::new(items)
         .block(
             Block::default()
-                .title(" Browse ")
+                .title(format!(" {title} · {count} "))
                 .borders(Borders::ALL)
-                .border_style(focus_border_style(state.focus == Focus::Sidebar)),
+                .border_style(focus_border_style(
+                    state.focus == Focus::Sidebar
+                        && state
+                            .selected_entry()
+                            .is_some_and(|entry| entry.kind == kind),
+                )),
         )
-        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
     let inner = Block::default().borders(Borders::ALL).inner(area);
-    state.sidebar_state.select(selected);
-    frame.render_stateful_widget(list, area, &mut state.sidebar_state);
-    let offset = state.sidebar_state.offset();
+    let list_state = match kind {
+        EntryKind::Job => &mut state.jobs_state,
+        EntryKind::Service => &mut state.services_state,
+    };
+    let previous_offset = list_state.offset();
+    list_state.select(selected);
+    if selected.is_none() {
+        *list_state.offset_mut() = previous_offset;
+    }
+    frame.render_stateful_widget(list, area, list_state);
+    let offset = list_state.offset();
     for (row, target) in row_targets {
         if row >= offset && row - offset < usize::from(inner.height) {
             state.mouse_targets.push((
@@ -1358,8 +1371,7 @@ fn draw_help(frame: &mut Frame<'_>) {
     let help = [
         "Navigation        ↑/↓ or j/k, Home/End, PgUp/PgDn",
         "Focus             Tab switches sidebar/details",
-        "Mouse             click entries, groups or tabs; wheel scrolls",
-        "Groups            g collapse, G expand all",
+        "Mouse             click entries or tabs; wheel scrolls",
         "Details           i summary, Enter log, h history, s schedule",
         "Logs              F toggles automatic follow",
         "Actions           r run/start, S terminate/stop, K force kill",
@@ -1919,24 +1931,6 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_groups_change_keyboard_navigation_set() {
-        let mut running = job_entry();
-        running.name = "running".to_string();
-        running.status = crate::state::JobStatus::Running;
-        running.group = Some("ops".to_string());
-        let idle = job_entry();
-        let mut state = UiState::new();
-        state.entries = vec![running.clone(), idle.clone()];
-
-        assert_eq!(state.visible_ids(), vec![running.uuid, idle.uuid]);
-
-        state
-            .collapsed_groups
-            .insert((EntryKind::Job, "ops".to_string()));
-        assert_eq!(state.visible_ids(), vec![idle.uuid]);
-    }
-
-    #[test]
     fn compact_status_uses_symbols_and_marks_unexpected_services() {
         let success = {
             let mut entry = job_entry();
@@ -1982,10 +1976,10 @@ mod tests {
         let output = render_at(80, 18, &mut state);
         assert!(output.contains("> ○ job-39"));
         assert!(output.contains("Details · job-39"));
-        let offset = state.sidebar_state.offset();
+        let offset = state.jobs_state.offset();
         assert!(offset > 0);
         render_at(80, 18, &mut state);
-        assert_eq!(state.sidebar_state.offset(), offset);
+        assert_eq!(state.jobs_state.offset(), offset);
 
         state.selected_uuid = Some(state.entries[0].uuid);
         assert!(render_at(80, 18, &mut state).contains("> ○ job-00"));
@@ -2000,7 +1994,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
 
         let output = render_at(40, 18, &mut state);
-        assert!(output.contains("Browse"));
+        assert!(output.contains("Jobs ·"));
         assert!(!output.contains("Details ·"));
         handle_key(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
@@ -2010,14 +2004,14 @@ mod tests {
         );
         let output = render_at(40, 18, &mut state);
         assert!(output.contains("Details · example"));
-        assert!(!output.contains("Browse"));
+        assert!(!output.contains("Jobs ·"));
         handle_key(
             KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
             &config,
             &mut state,
             &tx,
         );
-        assert!(render_at(40, 18, &mut state).contains("Browse"));
+        assert!(render_at(40, 18, &mut state).contains("Jobs ·"));
         assert!(render_at(39, 10, &mut state).contains("resize"));
     }
 
@@ -2098,18 +2092,20 @@ mod tests {
     }
 
     #[test]
-    fn mouse_toggles_groups_and_ignores_background_clicks_during_dialogs() {
+    fn mouse_ignores_background_clicks_during_dialogs() {
         let config = ClientConfig::default();
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut state = UiState::new();
         let mut entry = job_entry();
         entry.group = Some("maintenance".into());
-        state.entries = vec![entry];
+        let mut second = job_entry();
+        second.name = "second-job".into();
+        state.entries = vec![entry, second];
         state.reconcile_selection();
         let output = render_at(80, 24, &mut state);
         let row = output
             .lines()
-            .position(|line| line.contains("▾ maintenance"))
+            .position(|line| line.contains("second-job"))
             .unwrap() as u16;
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -2117,22 +2113,18 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        handle_mouse(click, &config, &mut state, &tx);
-        assert!(state.selected_uuid.is_none());
-        assert!(render_at(80, 24, &mut state).contains("▸ maintenance"));
         state.input_mode = InputMode::Help;
         handle_mouse(click, &config, &mut state, &tx);
-        assert_eq!(state.collapsed_groups.len(), 1);
+        assert_eq!(state.selected_uuid, Some(state.entries[0].uuid));
         state.input_mode = InputMode::ConfirmKill {
             uuid: state.entries[0].uuid,
             name: "example".into(),
         };
         handle_mouse(click, &config, &mut state, &tx);
-        assert_eq!(state.collapsed_groups.len(), 1);
+        assert_eq!(state.selected_uuid, Some(state.entries[0].uuid));
         state.input_mode = InputMode::Normal;
         handle_mouse(click, &config, &mut state, &tx);
-        assert!(state.collapsed_groups.is_empty());
-        assert_eq!(state.selected_uuid, Some(state.entries[0].uuid));
+        assert_eq!(state.selected_uuid, Some(state.entries[1].uuid));
         render_at(39, 10, &mut state);
         assert!(state.mouse_targets.is_empty());
     }
@@ -2160,6 +2152,65 @@ mod tests {
     }
 
     #[test]
+    fn job_and_service_panes_keep_independent_scroll_positions() {
+        let mut state = UiState::new();
+        state.entries = (0..30)
+            .map(|index| {
+                let mut entry = job_entry();
+                entry.name = format!("job-{index:02}");
+                entry
+            })
+            .collect();
+        let worker = service_entry(crate::state::JobStatus::Running, true);
+        let worker_id = worker.uuid;
+        state.entries.push(worker);
+        state.selected_uuid = Some(state.entries[29].uuid);
+        let output = render_at(80, 24, &mut state);
+        assert!(output.contains("job-29"));
+        assert!(output.contains("Services · 1"));
+        assert!(output.contains("● worker"));
+        let offset = state.jobs_state.offset();
+        assert!(offset > 0);
+
+        let config = ClientConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let row = output
+            .lines()
+            .position(|line| line.contains("Services · 1"))
+            .unwrap() as u16;
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &config,
+            &mut state,
+            &tx,
+        );
+        assert_eq!(state.selected_uuid, Some(worker_id));
+        render_at(80, 24, &mut state);
+        assert_eq!(state.jobs_state.offset(), offset);
+        assert_eq!(state.services_state.offset(), 0);
+
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 5,
+                row: row + 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            &config,
+            &mut state,
+            &tx,
+        );
+        assert_eq!(state.selected_uuid, Some(worker_id));
+        render_at(80, 24, &mut state);
+        assert_eq!(state.jobs_state.offset(), offset);
+    }
+
+    #[test]
     fn sidebar_and_details_share_the_body_at_normal_widths() {
         let entry = job_entry();
         let uuid = entry.uuid;
@@ -2174,7 +2225,7 @@ mod tests {
         assert!(wide.contains("Trigger"));
         assert!(wide.contains("Details · example"));
         for output in [&wide, &narrow] {
-            let borders = output.lines().find(|line| line.contains("Browse")).unwrap();
+            let borders = output.lines().find(|line| line.contains("Jobs ·")).unwrap();
             assert!(borders.contains("Details · example"));
             assert!(output.contains("Jobs · 1"));
             assert!(output.contains("Services · 0"));
@@ -2205,6 +2256,6 @@ mod tests {
 
         assert!(output.contains("Details · example"));
         assert!(output.contains("hello from stdout"));
-        assert!(output.contains("Browse"));
+        assert!(output.contains("Jobs ·"));
     }
 }

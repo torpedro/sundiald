@@ -332,6 +332,7 @@ mod tests {
         service::JobStatusResponse {
             uuid: Uuid::new_v4(),
             name: "example".to_string(),
+            command: Some("echo hello".to_string()),
             group: None,
             status,
             pid: None,

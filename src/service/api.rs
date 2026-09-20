@@ -57,6 +57,7 @@ pub struct StatusResponse {
 pub struct JobStatusResponse {
     pub uuid: Uuid,
     pub name: String,
+    pub command: Option<String>,
     pub group: Option<String>,
     pub status: JobStatus,
     pub pid: Option<u32>,
@@ -82,6 +83,7 @@ pub struct TriggerStatusResponse {
 pub struct ServiceStatusResponse {
     pub uuid: Uuid,
     pub name: String,
+    pub command: Option<String>,
     pub group: Option<String>,
     pub status: JobStatus,
     pub pid: Option<u32>,
@@ -908,6 +910,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
             JobStatusResponse {
                 uuid,
                 name: job.name.clone(),
+                command: Some(job.command.clone()),
                 group: job.group.clone(),
                 status: state
                     .map(|state| state.status.clone())
@@ -946,6 +949,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
         jobs.push(JobStatusResponse {
             uuid: *uuid,
             name: state.name.clone(),
+            command: None,
             group: None,
             status: state.status.clone(),
             pid: state.pid,
@@ -998,6 +1002,7 @@ pub(crate) async fn build_status_response(api: &ApiState) -> StatusResponse {
             ServiceStatusResponse {
                 uuid,
                 name: service.name.clone(),
+                command: Some(service.command.clone()),
                 group: service.group.clone(),
                 status: state
                     .map(|state| state.status.clone())
@@ -1313,6 +1318,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(status.jobs[0].name, "sleepy");
+        assert_eq!(status.jobs[0].command.as_deref(), Some("sleep 3"));
         assert_eq!(status.jobs[0].uuid, job_id);
         assert_eq!(status.jobs[0].next_runs.len(), 10);
         assert_eq!(
@@ -1386,6 +1392,7 @@ mod tests {
 
         assert_eq!(status.services.len(), 1);
         assert_eq!(status.services[0].name, "worker");
+        assert_eq!(status.services[0].command.as_deref(), Some("sleep 60"));
         assert_eq!(status.services[0].schedule, "permanent");
 
         let response = reqwest::Client::new()

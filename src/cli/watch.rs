@@ -17,7 +17,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, Tabs, Wrap,
+    },
 };
 use tokio::{
     sync::mpsc,
@@ -57,43 +59,14 @@ enum EntryKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FilterMode {
-    All,
-    Running,
-    Failed,
-    Unexpected,
-}
-
-impl FilterMode {
-    fn next(self) -> Self {
-        match self {
-            Self::All => Self::Running,
-            Self::Running => Self::Failed,
-            Self::Failed => Self::Unexpected,
-            Self::Unexpected => Self::All,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::All => "all",
-            Self::Running => "running",
-            Self::Failed => "failed",
-            Self::Unexpected => "unexpected",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
-    Table,
+    Sidebar,
     Details,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum InputMode {
     Normal,
-    Search,
     ConfirmKill { uuid: uuid::Uuid, name: String },
     Help,
 }
@@ -103,6 +76,7 @@ struct UiEntry {
     kind: EntryKind,
     uuid: uuid::Uuid,
     name: String,
+    command: Option<String>,
     group: Option<String>,
     status: state::JobStatus,
     pid: Option<u32>,
@@ -138,6 +112,7 @@ impl UiEntry {
             kind: EntryKind::Job,
             uuid: job.uuid,
             name: job.name,
+            command: job.command,
             group: job.group,
             status: job.status,
             pid: job.pid,
@@ -171,6 +146,7 @@ impl UiEntry {
             kind: EntryKind::Service,
             uuid: service.uuid,
             name: service.name,
+            command: service.command,
             group: service.group,
             status: service.status,
             pid: service.pid,
@@ -193,6 +169,7 @@ impl UiEntry {
 #[derive(Debug)]
 struct UiState {
     selected_uuid: Option<uuid::Uuid>,
+    sidebar_state: ListState,
     entries: Vec<UiEntry>,
     message: String,
     message_expires_at: Option<time::Instant>,
@@ -201,8 +178,6 @@ struct UiState {
     status_pending: bool,
     pending_actions: HashMap<uuid::Uuid, String>,
     reload_pending: bool,
-    filter: FilterMode,
-    search: String,
     collapsed_groups: HashSet<(EntryKind, String)>,
     input_mode: InputMode,
     focus: Focus,
@@ -220,6 +195,7 @@ impl UiState {
     fn new() -> Self {
         Self {
             selected_uuid: None,
+            sidebar_state: ListState::default(),
             entries: Vec::new(),
             message: "connecting".to_string(),
             message_expires_at: None,
@@ -228,11 +204,9 @@ impl UiState {
             status_pending: false,
             pending_actions: HashMap::new(),
             reload_pending: false,
-            filter: FilterMode::All,
-            search: String::new(),
             collapsed_groups: HashSet::new(),
             input_mode: InputMode::Normal,
-            focus: Focus::Table,
+            focus: Focus::Sidebar,
             detail_mode: DetailMode::Summary,
             detail_uuid: None,
             detail_loading: false,
@@ -271,47 +245,22 @@ impl UiState {
 
     fn clear_details(&mut self) {
         self.set_detail_mode(DetailMode::Summary);
-        self.focus = Focus::Table;
-    }
-
-    fn entry_visible(&self, entry: &UiEntry) -> bool {
-        let matches_filter = match self.filter {
-            FilterMode::All => true,
-            FilterMode::Running => matches!(entry.status, state::JobStatus::Running),
-            FilterMode::Failed => matches!(
-                entry.status,
-                state::JobStatus::Failed | state::JobStatus::StartFailed
-            ),
-            FilterMode::Unexpected => {
-                entry.kind == EntryKind::Service
-                    && (matches!(entry.status, state::JobStatus::Running) != entry.expected_running)
-            }
-        };
-        if !matches_filter {
-            return false;
-        }
-        let query = self.search.trim().to_lowercase();
-        query.is_empty()
-            || entry.name.to_lowercase().contains(&query)
-            || entry
-                .group
-                .as_deref()
-                .is_some_and(|group| group.to_lowercase().contains(&query))
-            || entry.trigger_label.to_lowercase().contains(&query)
+        self.focus = Focus::Sidebar;
     }
 
     fn group_collapsed(&self, entry: &UiEntry) -> bool {
-        self.search.is_empty()
-            && entry
-                .group
-                .as_ref()
-                .is_some_and(|group| self.collapsed_groups.contains(&(entry.kind, group.clone())))
+        entry
+            .group
+            .as_ref()
+            .is_some_and(|group| self.collapsed_groups.contains(&(entry.kind, group.clone())))
     }
 
     fn visible_ids(&self) -> Vec<uuid::Uuid> {
-        self.entries
-            .iter()
-            .filter(|entry| self.entry_visible(entry) && !self.group_collapsed(entry))
+        [EntryKind::Job, EntryKind::Service]
+            .into_iter()
+            .flat_map(|kind| group_entries(self, kind))
+            .flat_map(|(_, entries)| entries)
+            .filter(|entry| !self.group_collapsed(entry))
             .map(|entry| entry.uuid)
             .collect()
     }
@@ -368,7 +317,7 @@ pub(crate) async fn watch_status(config: ClientConfig) -> Result<()> {
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
     request_status(&config, &mut state, &event_tx);
-    terminal.draw(|frame| draw_ui(frame, &config, &state))?;
+    terminal.draw(|frame| draw_ui(frame, &config, &mut state))?;
 
     loop {
         tokio::select! {
@@ -386,12 +335,12 @@ pub(crate) async fn watch_status(config: ClientConfig) -> Result<()> {
                 {
                     request_selected_detail(&config, &mut state, &event_tx);
                 }
-                terminal.draw(|frame| draw_ui(frame, &config, &state))?;
+                terminal.draw(|frame| draw_ui(frame, &config, &mut state))?;
             }
             event = event_rx.recv() => {
                 if let Some(event) = event {
                     handle_ui_event(event, &config, &mut state, &event_tx);
-                    terminal.draw(|frame| draw_ui(frame, &config, &state))?;
+                    terminal.draw(|frame| draw_ui(frame, &config, &mut state))?;
                 }
             }
             key = keys.recv() => {
@@ -401,7 +350,7 @@ pub(crate) async fn watch_status(config: ClientConfig) -> Result<()> {
                 if handle_key(key, &config, &mut state, &event_tx) {
                     break;
                 }
-                terminal.draw(|frame| draw_ui(frame, &config, &state))?;
+                terminal.draw(|frame| draw_ui(frame, &config, &mut state))?;
             }
         }
     }
@@ -416,7 +365,6 @@ fn handle_key(
     event_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
     match &state.input_mode {
-        InputMode::Search => return handle_search_key(key, config, state, event_tx),
         InputMode::ConfirmKill { uuid, name } => {
             let uuid = *uuid;
             let name = name.clone();
@@ -487,16 +435,21 @@ fn handle_key(
         }
         KeyCode::Tab | KeyCode::BackTab => {
             state.focus = match state.focus {
-                Focus::Table => Focus::Details,
-                Focus::Details => Focus::Table,
+                Focus::Sidebar => Focus::Details,
+                Focus::Details => Focus::Sidebar,
             };
         }
         KeyCode::Left if state.focus == Focus::Details => {
-            switch_detail(config, state, event_tx, -1);
+            if state.detail_mode == DetailMode::Summary {
+                state.focus = Focus::Sidebar;
+            } else {
+                switch_detail(config, state, event_tx, -1);
+            }
         }
         KeyCode::Right if state.focus == Focus::Details => {
             switch_detail(config, state, event_tx, 1);
         }
+        KeyCode::Right => state.focus = Focus::Details,
         KeyCode::Char('r') => {
             if let Some((kind, uuid, name)) = state.selected_action_target() {
                 let entry = state
@@ -610,14 +563,6 @@ fn handle_key(
             };
             state.message_expires_at = Some(time::Instant::now() + Duration::from_secs(3));
         }
-        KeyCode::Char('/') => {
-            state.input_mode = InputMode::Search;
-        }
-        KeyCode::Char('f') => {
-            state.filter = state.filter.next();
-            state.reconcile_selection();
-            selection_changed(config, state, event_tx);
-        }
         KeyCode::Char('g') => {
             if let Some(entry) = state.selected_entry()
                 && let Some(group) = &entry.group
@@ -627,11 +572,13 @@ fn handle_key(
                     state.collapsed_groups.insert(key);
                 }
                 state.reconcile_selection();
+                selection_changed(config, state, event_tx);
             }
         }
         KeyCode::Char('G') => {
             state.collapsed_groups.clear();
             state.reconcile_selection();
+            selection_changed(config, state, event_tx);
         }
         KeyCode::Char('?') => {
             state.input_mode = InputMode::Help;
@@ -646,28 +593,6 @@ fn handle_key(
         _ => {}
     }
 
-    false
-}
-
-fn handle_search_key(
-    key: KeyEvent,
-    config: &ClientConfig,
-    state: &mut UiState,
-    event_tx: &mpsc::UnboundedSender<UiEvent>,
-) -> bool {
-    match key.code {
-        KeyCode::Esc | KeyCode::Enter => state.input_mode = InputMode::Normal,
-        KeyCode::Backspace => {
-            state.search.pop();
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => state.search.clear(),
-        KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            state.search.push(character)
-        }
-        _ => {}
-    }
-    state.reconcile_selection();
-    selection_changed(config, state, event_tx);
     false
 }
 
@@ -698,6 +623,7 @@ fn handle_ui_event(
 ) {
     match event {
         UiEvent::Status(Ok(status)) => {
+            let previous_selection = state.selected_uuid;
             state.status_pending = false;
             state.connected = true;
             state.last_refresh = Some(Local::now());
@@ -708,6 +634,9 @@ fn handle_ui_event(
                 .chain(status.services.into_iter().map(UiEntry::from_service))
                 .collect();
             state.reconcile_selection();
+            if state.selected_uuid != previous_selection {
+                selection_changed(config, state, event_tx);
+            }
             if state.message == "connecting" || state.message.starts_with("status refresh failed") {
                 state.message = "ready".to_string();
             }
@@ -784,6 +713,7 @@ fn selection_changed(
     state.detail_log = None;
     state.detail_history = None;
     state.detail_error = None;
+    state.detail_loading = false;
     if matches!(state.detail_mode, DetailMode::Log | DetailMode::History) {
         request_selected_detail(config, state, event_tx);
     }
@@ -871,7 +801,14 @@ fn start_kill(
     );
 }
 
-fn draw_ui(frame: &mut Frame<'_>, config: &ClientConfig, state: &UiState) {
+fn draw_ui(frame: &mut Frame<'_>, config: &ClientConfig, state: &mut UiState) {
+    if frame.area().width < 40 || frame.area().height < 12 {
+        frame.render_widget(
+            Paragraph::new("sundiald — resize to at least 40×12. q quits."),
+            frame.area(),
+        );
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -882,18 +819,18 @@ fn draw_ui(frame: &mut Frame<'_>, config: &ClientConfig, state: &UiState) {
         .split(frame.area());
 
     draw_header(frame, chunks[0], config, state);
-    if chunks[1].height < 20 {
-        if state.detail_mode == DetailMode::Summary {
-            draw_jobs(frame, chunks[1], state);
-        } else {
-            draw_details(frame, chunks[1], state);
+    if chunks[1].width < 60 {
+        match state.focus {
+            Focus::Sidebar => draw_sidebar(frame, chunks[1], state),
+            Focus::Details => draw_details(frame, chunks[1], state),
         }
     } else {
-        let body = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(8), Constraint::Length(12)])
-            .split(chunks[1]);
-        draw_jobs(frame, body[0], state);
+        let body = Layout::horizontal([
+            Constraint::Length((chunks[1].width / 4).clamp(20, 32)),
+            Constraint::Min(1),
+        ])
+        .split(chunks[1]);
+        draw_sidebar(frame, body[0], state);
         draw_details(frame, body[1], state);
     }
     draw_footer(frame, chunks[2], state);
@@ -901,7 +838,7 @@ fn draw_ui(frame: &mut Frame<'_>, config: &ClientConfig, state: &UiState) {
     match &state.input_mode {
         InputMode::ConfirmKill { name, .. } => draw_confirmation(frame, name),
         InputMode::Help => draw_help(frame),
-        InputMode::Normal | InputMode::Search => {}
+        InputMode::Normal => {}
     }
 }
 
@@ -940,227 +877,77 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &ClientConfig, state: 
     );
 }
 
-fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let now = Local::now();
-    let mut selected_row = None;
-    let mut row_index = 0usize;
-    let mut rows = Vec::new();
-
-    let column_mode = if area.width >= 120 {
-        5
-    } else if area.width >= 85 {
-        4
-    } else {
-        3
-    };
-
-    push_section_rows(
-        &mut rows,
-        &mut row_index,
-        &mut selected_row,
-        state,
-        EntryKind::Job,
-        "Jobs",
-        "no jobs",
-        now,
-        column_mode,
-    );
-    push_section_rows(
-        &mut rows,
-        &mut row_index,
-        &mut selected_row,
-        state,
-        EntryKind::Service,
-        "Services",
-        "no services",
-        now,
-        column_mode,
-    );
-
-    let (headers, constraints): (Vec<&str>, Vec<Constraint>) = match column_mode {
-        5 => (
-            vec!["Name", "Status", "Trigger", "Last Run", "Next"],
-            vec![
-                Constraint::Percentage(24),
-                Constraint::Percentage(16),
-                Constraint::Percentage(16),
-                Constraint::Percentage(24),
-                Constraint::Percentage(20),
-            ],
-        ),
-        4 => (
-            vec!["Name", "Status", "Last Run", "Next"],
-            vec![
-                Constraint::Percentage(28),
-                Constraint::Percentage(22),
-                Constraint::Percentage(27),
-                Constraint::Percentage(23),
-            ],
-        ),
-        _ => (
-            vec!["Name", "Status", "Next"],
-            vec![
-                Constraint::Percentage(38),
-                Constraint::Percentage(30),
-                Constraint::Percentage(32),
-            ],
-        ),
-    };
-    let failed = state
-        .entries
-        .iter()
-        .filter(|entry| {
-            matches!(
-                entry.status,
-                state::JobStatus::Failed | state::JobStatus::StartFailed
-            )
-        })
-        .count();
-    let title = if state.search.is_empty() {
-        format!(
-            "Runnables · filter: {} · failed: {failed}",
-            state.filter.label()
-        )
-    } else {
-        format!(
-            "Runnables · filter: {} · search: {} · failed: {failed}",
-            state.filter.label(),
-            state.search
-        )
-    };
-    let table = Table::new(rows, constraints)
-        .header(Row::new(headers).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
+fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
+    let mut items = Vec::new();
+    let mut selected = None;
+    for (kind, title) in [(EntryKind::Job, "Jobs"), (EntryKind::Service, "Services")] {
+        if kind == EntryKind::Service {
+            items.push(ListItem::new(""));
+        }
+        let groups = group_entries(state, kind);
+        let count: usize = groups.iter().map(|(_, entries)| entries.len()).sum();
+        items.push(
+            ListItem::new(format!("{title} · {count}"))
+                .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        );
+        if groups.is_empty() {
+            items.push(ListItem::new("  No entries").style(Style::default().fg(MUTED)));
+        }
+        for (group, entries) in groups {
+            let collapsed = entries
+                .first()
+                .is_some_and(|entry| state.group_collapsed(entry));
+            if let Some(group) = &group {
+                items.push(
+                    ListItem::new(format!("{} {group}", if collapsed { "▸" } else { "▾" }))
+                        .style(Style::default().fg(MUTED)),
+                );
+            }
+            if collapsed {
+                continue;
+            }
+            for entry in entries {
+                if state.selected_uuid == Some(entry.uuid) {
+                    selected = Some(items.len());
+                }
+                let pending =
+                    state.pending_actions.contains_key(&entry.uuid) || entry.manual_pending;
+                let symbol = if pending {
+                    "…"
+                } else {
+                    match entry.status {
+                        state::JobStatus::Running => "●",
+                        state::JobStatus::Succeeded => "✓",
+                        state::JobStatus::Failed | state::JobStatus::StartFailed => "×",
+                        state::JobStatus::Interrupted => "!",
+                        state::JobStatus::Idle => "○",
+                    }
+                };
+                items.push(ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{symbol} "),
+                        if pending {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            status_style(entry)
+                        },
+                    ),
+                    Span::raw(entry.name.clone()),
+                ])));
+            }
+        }
+    }
+    let list = List::new(items)
         .block(
             Block::default()
-                .title(title)
+                .title(" Browse ")
                 .borders(Borders::ALL)
-                .border_style(focus_border_style(state.focus == Focus::Table)),
+                .border_style(focus_border_style(state.focus == Focus::Sidebar)),
         )
-        .row_highlight_style(Style::default().fg(Color::Black).bg(ACCENT))
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-
-    let mut table_state = TableState::default().with_selected(selected_row);
-    frame.render_stateful_widget(table, area, &mut table_state);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_section_rows(
-    rows: &mut Vec<Row<'static>>,
-    row_index: &mut usize,
-    selected_row: &mut Option<usize>,
-    state: &UiState,
-    kind: EntryKind,
-    title: &str,
-    empty_label: &str,
-    now: chrono::DateTime<Local>,
-    column_mode: usize,
-) {
-    let visible_count = state
-        .entries
-        .iter()
-        .filter(|entry| entry.kind == kind && state.entry_visible(entry))
-        .count();
-    let failed_count = state
-        .entries
-        .iter()
-        .filter(|entry| {
-            entry.kind == kind
-                && state.entry_visible(entry)
-                && matches!(
-                    entry.status,
-                    state::JobStatus::Failed | state::JobStatus::StartFailed
-                )
-        })
-        .count();
-    let section_title = if failed_count > 0 {
-        format!("{title}  {visible_count}  failed {failed_count}")
-    } else {
-        format!("{title}  {visible_count}")
-    };
-    rows.push(
-        Row::new(section_cells(section_title, column_mode))
-            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
-    );
-    *row_index += 1;
-
-    let groups = group_entries(state, kind);
-    if groups.is_empty() {
-        rows.push(Row::new(section_cells(
-            format!("  {empty_label}"),
-            column_mode,
-        )));
-        *row_index += 1;
-        return;
-    }
-
-    for (group, entries) in groups {
-        let collapsed = group.as_ref().is_some_and(|group| {
-            state.collapsed_groups.contains(&(kind, group.to_string())) && state.search.is_empty()
-        });
-        if let Some(group) = &group {
-            let marker = if collapsed { "▸" } else { "▾" };
-            rows.push(
-                Row::new(section_cells(
-                    format!("  {marker} {group}  {}", entries.len()),
-                    column_mode,
-                ))
-                .style(Style::default().fg(ACCENT)),
-            );
-            *row_index += 1;
-        }
-
-        if collapsed {
-            continue;
-        }
-
-        for entry in entries {
-            if Some(entry.uuid) == state.selected_uuid {
-                *selected_row = Some(*row_index);
-            }
-            rows.push(Row::new(entry_cells(
-                entry,
-                now,
-                column_mode,
-                state.pending_actions.get(&entry.uuid).map(String::as_str),
-            )));
-            *row_index += 1;
-        }
-    }
-}
-
-fn section_cells(title: String, column_mode: usize) -> Vec<Cell<'static>> {
-    std::iter::once(Cell::from(title))
-        .chain((1..column_mode).map(|_| Cell::from("")))
-        .collect()
-}
-
-fn entry_cells(
-    entry: &UiEntry,
-    now: chrono::DateTime<Local>,
-    column_mode: usize,
-    pending: Option<&str>,
-) -> Vec<Cell<'static>> {
-    let name = Cell::from(format!("  {}", entry.name));
-    let status = pending.map_or_else(
-        || status_cell(entry),
-        |pending| Cell::from(format!("… {pending}")).style(Style::default().fg(Color::Yellow)),
-    );
-    match column_mode {
-        5 => vec![
-            name,
-            status,
-            Cell::from(entry.trigger_label.clone()),
-            Cell::from(format_last_run(entry, now)),
-            Cell::from(entry.next_label.clone()),
-        ],
-        4 => vec![
-            name,
-            status,
-            Cell::from(format_last_run(entry, now)),
-            Cell::from(entry.next_label.clone()),
-        ],
-        _ => vec![name, status, Cell::from(entry.next_label.clone())],
-    }
+    state.sidebar_state.select(selected);
+    frame.render_stateful_widget(list, area, &mut state.sidebar_state);
 }
 
 fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
@@ -1169,7 +956,7 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .map(|entry| entry.name.as_str())
         .unwrap_or("No selection");
     let block = Block::default()
-        .title(format!("Details · {name}"))
+        .title(format!(" Details · {name} "))
         .borders(Borders::ALL)
         .border_style(focus_border_style(state.focus == Focus::Details));
     let inner = block.inner(area);
@@ -1243,8 +1030,7 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 fn draw_summary(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let Some(entry) = state.selected_entry() else {
         frame.render_widget(
-            Paragraph::new("No runnable matches the current view.")
-                .style(Style::default().fg(MUTED)),
+            Paragraph::new("No job or service selected.").style(Style::default().fg(MUTED)),
             area,
         );
         return;
@@ -1265,23 +1051,60 @@ fn draw_summary(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     } else {
         "-"
     };
-    let lines = vec![
-        Line::from(format!("UUID: {}   Group: {group}", entry.uuid)),
-        Line::from(format!(
-            "Status: {}   PID: {}   Runtime: {runtime}   Expected: {expected}",
-            compact_status(entry),
+    let field = |label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(format!("{label}: "), Style::default().fg(ACCENT)),
+            Span::raw(value),
+        ])
+    };
+    let kind = if entry.kind == EntryKind::Job {
+        "Job"
+    } else {
+        "Service"
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!("{kind} · {}", entry.name),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+        Line::from(vec![
+            Span::styled("Status: ", Style::default().fg(ACCENT)),
+            Span::styled(compact_status(entry), status_style(entry)),
+        ]),
+    ];
+    if let Some(pending) = state.pending_actions.get(&entry.uuid) {
+        lines.push(field("Action", pending.clone()));
+    }
+    lines.extend([
+        field(
+            "Command",
+            entry
+                .command
+                .clone()
+                .unwrap_or_else(|| "unavailable".into()),
+        ),
+        field("Group", group.to_string()),
+        field("Trigger", entry.trigger_label.clone()),
+        field("Last run", format_last_run(entry, Local::now())),
+        field("Next", entry.next_label.clone()),
+        field(
+            "PID",
             entry
                 .pid
                 .map(|pid| pid.to_string())
-                .unwrap_or_else(|| "-".to_string())
-        )),
-        Line::from(format!(
-            "Trigger: {}   Next: {}",
-            entry.trigger_label, entry.next_label
-        )),
-        Line::from(format!("Last error: {error}")),
-    ];
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+                .unwrap_or_else(|| "-".into()),
+        ),
+        field("Runtime", runtime),
+        field("Expected", expected.to_string()),
+        field("Last error", error.to_string()),
+        field("UUID", entry.uuid.to_string()),
+    ]);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((state.detail_scroll, 0)),
+        area,
+    );
 }
 
 fn draw_history_table(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
@@ -1342,13 +1165,15 @@ fn draw_history_table(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 }
 
 fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
-    let text = if state.input_mode == InputMode::Search {
+    let text = if area.width < 90 {
         format!(
-            "/ {}_   Enter accept   Esc close   Ctrl-U clear",
-            state.search
+            "Tab {}  ? help  q quit",
+            if state.focus == Focus::Sidebar {
+                "details"
+            } else {
+                "browse"
+            }
         )
-    } else if area.width < 90 {
-        "? help  r start  S stop  q quit".to_string()
     } else {
         let actions = state.selected_entry().map_or("", |entry| {
             if matches!(entry.status, state::JobStatus::Running) {
@@ -1357,7 +1182,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
                 "r run/start"
             }
         });
-        format!("? help  {actions}  R reload  x dismiss  q quit")
+        format!("↑↓ select/scroll  Tab focus  ? help  {actions}  R reload  q quit")
     };
     frame.render_widget(Paragraph::new(text), area);
 }
@@ -1365,7 +1190,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 fn group_entries(state: &UiState, kind: EntryKind) -> Vec<(Option<String>, Vec<&UiEntry>)> {
     let mut groups: Vec<(Option<String>, Vec<&UiEntry>)> = Vec::new();
     for entry in &state.entries {
-        if entry.kind != kind || !state.entry_visible(entry) {
+        if entry.kind != kind {
             continue;
         }
         let group = entry.group.clone();
@@ -1417,8 +1242,8 @@ fn draw_help(frame: &mut Frame<'_>) {
     frame.render_widget(Clear, area);
     let help = [
         "Navigation        ↑/↓ or j/k, Home/End, PgUp/PgDn",
-        "Focus             Tab switches table/details",
-        "Find and filter   / search, f cycle filter, g collapse, G expand all",
+        "Focus             Tab switches sidebar/details",
+        "Groups            g collapse, G expand all",
         "Details           i summary, Enter log, h history, s schedule",
         "Logs              F toggles automatic follow",
         "Actions           r run/start, S terminate/stop, K force kill",
@@ -1489,10 +1314,6 @@ fn compact_status(entry: &UiEntry) -> String {
 
 fn focus_border_style(focused: bool) -> Style {
     Style::default().fg(if focused { ACCENT } else { MUTED })
-}
-
-fn status_cell(entry: &UiEntry) -> Cell<'static> {
-    Cell::from(compact_status(entry)).style(status_style(entry))
 }
 
 fn status_style(entry: &UiEntry) -> Style {
@@ -1786,6 +1607,7 @@ mod tests {
         UiEntry::from_job(service::JobStatusResponse {
             uuid: Uuid::new_v4(),
             name: "example".to_string(),
+            command: Some("echo hello".to_string()),
             group: None,
             status: crate::state::JobStatus::Idle,
             pid: None,
@@ -1810,6 +1632,7 @@ mod tests {
             kind: EntryKind::Service,
             uuid: Uuid::new_v4(),
             name: "worker".to_string(),
+            command: Some("worker --serve".to_string()),
             group: None,
             status,
             pid: None,
@@ -1828,7 +1651,7 @@ mod tests {
         }
     }
 
-    fn render_at(width: u16, height: u16, state: &UiState) -> String {
+    fn render_at(width: u16, height: u16, state: &mut UiState) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
         let config = ClientConfig::default();
@@ -1978,22 +1801,21 @@ mod tests {
     }
 
     #[test]
-    fn filters_and_collapsed_groups_change_keyboard_navigation_set() {
+    fn collapsed_groups_change_keyboard_navigation_set() {
         let mut running = job_entry();
         running.name = "running".to_string();
         running.status = crate::state::JobStatus::Running;
         running.group = Some("ops".to_string());
         let idle = job_entry();
         let mut state = UiState::new();
-        state.entries = vec![running.clone(), idle];
-        state.filter = FilterMode::Running;
+        state.entries = vec![running.clone(), idle.clone()];
 
-        assert_eq!(state.visible_ids(), vec![running.uuid]);
+        assert_eq!(state.visible_ids(), vec![running.uuid, idle.uuid]);
 
         state
             .collapsed_groups
             .insert((EntryKind::Job, "ops".to_string()));
-        assert!(state.visible_ids().is_empty());
+        assert_eq!(state.visible_ids(), vec![idle.uuid]);
     }
 
     #[test]
@@ -2010,7 +1832,79 @@ mod tests {
     }
 
     #[test]
-    fn responsive_table_hides_columns_before_truncating_primary_state() {
+    fn navigation_follows_sidebar_group_order() {
+        let mut first = job_entry();
+        first.group = Some("ops".into());
+        let ungrouped = job_entry();
+        let mut second = job_entry();
+        second.group = first.group.clone();
+        let service = service_entry(crate::state::JobStatus::Running, true);
+        let expected = vec![first.uuid, second.uuid, ungrouped.uuid, service.uuid];
+        let mut state = UiState::new();
+        state.entries = vec![first, service, ungrouped, second];
+
+        assert_eq!(state.visible_ids(), expected);
+        state.reconcile_selection();
+        assert!(state.move_selection(1));
+        assert_eq!(state.selected_uuid, Some(expected[1]));
+    }
+
+    #[test]
+    fn sidebar_scrolls_to_selection_and_preserves_offset() {
+        let mut state = UiState::new();
+        state.entries = (0..40)
+            .map(|index| {
+                let mut entry = job_entry();
+                entry.name = format!("job-{index:02}");
+                entry
+            })
+            .collect();
+        state.selected_uuid = Some(state.entries[39].uuid);
+
+        let output = render_at(80, 18, &mut state);
+        assert!(output.contains("> ○ job-39"));
+        assert!(output.contains("Details · job-39"));
+        let offset = state.sidebar_state.offset();
+        assert!(offset > 0);
+        render_at(80, 18, &mut state);
+        assert_eq!(state.sidebar_state.offset(), offset);
+
+        state.selected_uuid = Some(state.entries[0].uuid);
+        assert!(render_at(80, 18, &mut state).contains("> ○ job-00"));
+    }
+
+    #[test]
+    fn narrow_terminal_switches_between_sidebar_and_details() {
+        let mut state = UiState::new();
+        state.entries = vec![job_entry()];
+        state.reconcile_selection();
+        let config = ClientConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        let output = render_at(40, 18, &mut state);
+        assert!(output.contains("Browse"));
+        assert!(!output.contains("Details ·"));
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &config,
+            &mut state,
+            &tx,
+        );
+        let output = render_at(40, 18, &mut state);
+        assert!(output.contains("Details · example"));
+        assert!(!output.contains("Browse"));
+        handle_key(
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+            &config,
+            &mut state,
+            &tx,
+        );
+        assert!(render_at(40, 18, &mut state).contains("Browse"));
+        assert!(render_at(39, 10, &mut state).contains("resize"));
+    }
+
+    #[test]
+    fn sidebar_and_details_share_the_body_at_normal_widths() {
         let entry = job_entry();
         let uuid = entry.uuid;
         let mut state = UiState::new();
@@ -2018,19 +1912,24 @@ mod tests {
         state.entries = vec![entry];
         state.selected_uuid = Some(uuid);
 
-        let wide = render_at(140, 36, &state);
-        let narrow = render_at(70, 18, &state);
+        let wide = render_at(140, 36, &mut state);
+        let narrow = render_at(70, 18, &mut state);
 
         assert!(wide.contains("Trigger"));
         assert!(wide.contains("Details · example"));
-        assert!(narrow.contains("Name"));
-        assert!(narrow.contains("Status"));
-        assert!(narrow.contains("Next"));
-        assert!(!narrow.contains("Trigger"));
+        for output in [&wide, &narrow] {
+            let borders = output.lines().find(|line| line.contains("Browse")).unwrap();
+            assert!(borders.contains("Details · example"));
+            assert!(output.contains("Jobs · 1"));
+            assert!(output.contains("Services · 0"));
+            assert!(output.contains("Status:"));
+            assert!(output.contains("Trigger:"));
+            assert!(output.contains("Command: echo hello"));
+        }
     }
 
     #[test]
-    fn short_terminal_replaces_table_with_open_details() {
+    fn short_terminal_keeps_sidebar_beside_open_details() {
         let entry = job_entry();
         let uuid = entry.uuid;
         let mut state = UiState::new();
@@ -2046,10 +1945,10 @@ mod tests {
             stderr_content: None,
         });
 
-        let output = render_at(80, 18, &state);
+        let output = render_at(80, 18, &mut state);
 
         assert!(output.contains("Details · example"));
         assert!(output.contains("hello from stdout"));
-        assert!(!output.contains("Runnables"));
+        assert!(output.contains("Browse"));
     }
 }

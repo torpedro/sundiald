@@ -525,6 +525,10 @@ fn job_identities(config: &SundialdConfig) -> Vec<(Uuid, String)> {
         .collect()
 }
 
+// Borrows the scheduler loop's run bookkeeping alongside the shared handles it
+// forwards to `spawn_tracked_job`; a context struct would restate the loop's
+// own locals without removing a parameter.
+#[allow(clippy::too_many_arguments)]
 async fn handle_manual_request(
     config: &SundialdConfig,
     running: &mut HashMap<Uuid, RunningJob>,
@@ -654,6 +658,10 @@ async fn handle_job_completion(
     }
 }
 
+// Three pieces of per-loop service bookkeeping are borrowed mutably here, so
+// they cannot be grouped behind one owned struct; the rest are the shared
+// handles passed on to `spawn_tracked_service`.
+#[allow(clippy::too_many_arguments)]
 async fn handle_service_command(
     config: &SundialdConfig,
     running_services: &mut HashMap<Uuid, RunningJob>,
@@ -808,12 +816,12 @@ async fn check_service_grace_alerts(
             service_grace_alerted.remove(&uuid);
             continue;
         }
-        if let ServiceSchedule::Window { start: _, stop: _ } = &service.schedule {
-            if !service_is_inside_runtime(service, now) {
-                let grace = chrono::Duration::from_std(service.stop_grace())
-                    .unwrap_or_else(|_| chrono::Duration::seconds(30));
-                service_stop_deadlines.entry(uuid).or_insert(now + grace);
-            }
+        if let ServiceSchedule::Window { start: _, stop: _ } = &service.schedule
+            && !service_is_inside_runtime(service, now)
+        {
+            let grace = chrono::Duration::from_std(service.stop_grace())
+                .unwrap_or_else(|_| chrono::Duration::seconds(30));
+            service_stop_deadlines.entry(uuid).or_insert(now + grace);
         }
         if service_stop_deadlines
             .get(&uuid)

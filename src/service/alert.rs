@@ -65,15 +65,15 @@ async fn write_alert_inner(alert: &AlertConfig, job_name: &str, message: &str) -
     file.write_all(line.as_bytes()).await?;
     println!("{line}");
 
-    if let Some(alert_command) = &alert.command {
-        if let Err(error) = run_alert_command(alert_command, job_name, message, &alert_file).await {
-            eprintln!("failed to run alert command for job '{job_name}': {error:#}");
-        }
+    if let Some(alert_command) = &alert.command
+        && let Err(error) = run_alert_command(alert_command, job_name, message, &alert_file).await
+    {
+        eprintln!("failed to run alert command for job '{job_name}': {error:#}");
     }
-    if let Some(pushover) = &alert.pushover {
-        if let Err(error) = send_pushover_alert(pushover, job_name, message).await {
-            eprintln!("failed to send Pushover alert for job '{job_name}': {error:#}");
-        }
+    if let Some(pushover) = &alert.pushover
+        && let Err(error) = send_pushover_alert(pushover, job_name, message).await
+    {
+        eprintln!("failed to send Pushover alert for job '{job_name}': {error:#}");
     }
     if let Some(flares) = &alert.flares
         && let Err(error) = send_flares_alert(flares, job_name, message).await

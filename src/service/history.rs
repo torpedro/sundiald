@@ -135,6 +135,9 @@ impl HistoryDb {
         .await
     }
 
+    // These parameters are the columns of the run row being updated; grouping
+    // them would restate the table schema in a struct.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_finished(
         &self,
         run_id: i64,

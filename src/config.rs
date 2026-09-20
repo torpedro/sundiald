@@ -191,6 +191,10 @@ pub struct ServiceConfig {
     pub source_path: Option<PathBuf>,
 }
 
+// Boxing `Window` would save bytes on `Permanent`, but a process holds one
+// schedule per configured service, so the saving is irrelevant and the
+// indirection would complicate the eight construction and match sites.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum ServiceSchedule {
     Permanent,
@@ -416,10 +420,10 @@ impl SundialdConfig {
             bail!("api_token is required when api_bind is not a loopback address");
         }
 
-        if let Some(command) = &self.alert.command {
-            if command.program.trim().is_empty() {
-                bail!("alert.command.program cannot be empty");
-            }
+        if let Some(command) = &self.alert.command
+            && command.program.trim().is_empty()
+        {
+            bail!("alert.command.program cannot be empty");
         }
         if let Some(pushover) = &self.alert.pushover {
             if pushover.token.trim().is_empty() {
@@ -428,10 +432,10 @@ impl SundialdConfig {
             if pushover.user.trim().is_empty() {
                 bail!("alert.pushover.user cannot be empty");
             }
-            if let Some(priority) = pushover.priority {
-                if !(-2..=2).contains(&priority) {
-                    bail!("alert.pushover.priority must be between -2 and 2");
-                }
+            if let Some(priority) = pushover.priority
+                && !(-2..=2).contains(&priority)
+            {
+                bail!("alert.pushover.priority must be between -2 and 2");
             }
         }
 
@@ -476,10 +480,10 @@ impl SundialdConfig {
                 bail!("duplicate job name '{}' ({job_context})", job.name);
             }
             job_names.insert(job.name.clone());
-            if let Some(uuid) = job.uuid {
-                if !uuids.insert(uuid) {
-                    bail!("duplicate job uuid '{uuid}' ({job_context})");
-                }
+            if let Some(uuid) = job.uuid
+                && !uuids.insert(uuid)
+            {
+                bail!("duplicate job uuid '{uuid}' ({job_context})");
             }
             if job.command.trim().is_empty() {
                 bail!("command cannot be empty ({job_context})");
@@ -507,10 +511,10 @@ impl SundialdConfig {
                     service.name
                 );
             }
-            if let Some(uuid) = service.uuid {
-                if !uuids.insert(uuid) {
-                    bail!("duplicate service uuid '{uuid}' ({service_context})");
-                }
+            if let Some(uuid) = service.uuid
+                && !uuids.insert(uuid)
+            {
+                bail!("duplicate service uuid '{uuid}' ({service_context})");
             }
             if service.command.trim().is_empty() {
                 bail!("service command cannot be empty ({service_context})");

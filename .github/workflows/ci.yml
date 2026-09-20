@@ -11,7 +11,7 @@ permissions:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -32,9 +32,8 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all --check
       - name: Run Clippy
-        # Keep existing warnings visible until the lint backlog is resolved.
-        run: cargo clippy --all-targets --locked
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Run tests
-        run: cargo test --locked
+        run: cargo test --workspace --locked
       - name: Verify package
-        run: cargo publish --dry-run --locked --registry crates-io
+        run: cargo publish --workspace --dry-run --locked --registry crates-io

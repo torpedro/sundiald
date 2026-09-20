@@ -100,6 +100,9 @@ pub(crate) struct RunningJob {
     pub(crate) control_tx: mpsc::UnboundedSender<JobControl>,
 }
 
+// Threads the full run environment into the supervision task; a context struct
+// would only move the same fields behind one name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tracked_job(
     job: JobConfig,
     log_dir: PathBuf,
@@ -144,6 +147,9 @@ pub(crate) fn spawn_tracked_job(
     RunningJob { handle, control_tx }
 }
 
+// Threads the full run environment into the supervision task; a context struct
+// would only move the same fields behind one name.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_tracked_service(
     service: ServiceConfig,
     log_dir: PathBuf,
@@ -187,6 +193,9 @@ pub(crate) fn spawn_tracked_service(
     RunningJob { handle, control_tx }
 }
 
+// Receives the run environment from `spawn_tracked_job` and hands it to
+// `run_job_inner` unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn run_job(
     job: JobConfig,
     log_dir: PathBuf,
@@ -252,6 +261,8 @@ async fn persist_state(state_dir: &Path, state: &Mutex<StateSnapshot>, job_state
     }
 }
 
+// Forwards the finished-run columns to `HistoryDb::record_finished`.
+#[allow(clippy::too_many_arguments)]
 async fn record_history_finished(
     history: &HistoryDb,
     run_id: Option<i64>,
@@ -282,6 +293,8 @@ async fn record_history_finished(
     }
 }
 
+// Receives the run environment from `run_job` unchanged.
+#[allow(clippy::too_many_arguments)]
 async fn run_job_inner(
     job: JobConfig,
     log_dir: PathBuf,

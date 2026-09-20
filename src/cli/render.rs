@@ -93,10 +93,12 @@ pub(crate) async fn render_status(
     Ok((output, status.jobs))
 }
 
-pub(crate) fn group_jobs(
-    jobs: &[service::JobStatusResponse],
-) -> Vec<(Option<String>, Vec<(usize, &service::JobStatusResponse)>)> {
-    let mut groups: Vec<(Option<String>, Vec<(usize, &service::JobStatusResponse)>)> = Vec::new();
+/// Jobs bucketed by their optional group, each entry keeping the job's index in
+/// the original slice so callers can refer back to it.
+pub(crate) type JobGroups<'a> = Vec<(Option<String>, Vec<(usize, &'a service::JobStatusResponse)>)>;
+
+pub(crate) fn group_jobs(jobs: &[service::JobStatusResponse]) -> JobGroups<'_> {
+    let mut groups: JobGroups<'_> = Vec::new();
     for (index, job) in jobs.iter().enumerate() {
         let group = job.group.clone();
         if let Some((_, entries)) = groups.iter_mut().find(|(existing, _)| *existing == group) {

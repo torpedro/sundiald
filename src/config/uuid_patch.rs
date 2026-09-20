@@ -30,10 +30,10 @@ pub(crate) fn insert_missing_job_uuids(raw: &str, missing: &[(String, Uuid)]) ->
     let mut output = Vec::with_capacity(raw.lines().count() + missing.len());
     for line in raw.lines() {
         output.push(line.to_string());
-        if let Some((indent, name)) = parse_dash_name_line(line) {
-            if let Some(uuid) = remaining.remove(name.as_str()) {
-                output.push(format!("{indent}  uuid: {uuid}"));
-            }
+        if let Some((indent, name)) = parse_dash_name_line(line)
+            && let Some(uuid) = remaining.remove(name.as_str())
+        {
+            output.push(format!("{indent}  uuid: {uuid}"));
         }
     }
 

@@ -26,7 +26,7 @@ for account setup.
 
 ## 1. Choose the version
 
-Edit `[package].version` in `Cargo.toml`. Use this project policy:
+Use this project policy:
 
 | Change | Version example |
 | --- | --- |
@@ -43,11 +43,22 @@ state when assessing compatibility. Document migration steps for breaking change
 ## 2. Prepare and test
 
 Start from the intended release branch with unrelated changes committed or set
-aside. Update the README and examples for any changed behavior. In `CHANGELOG.md`,
-move the `## Unreleased` entries under a new version heading; those entries become
-the release notes. Document migration steps for breaking changes there.
+aside. Update the README and examples for any changed behavior. Make sure
+`CHANGELOG.md` records everything in this release under `## Unreleased`, including
+migration steps for breaking changes; those entries become the release notes.
 
-After editing the version, refresh the app's lockfile entry and run checks:
+Set the version and update the changelog in one step:
+
+```sh
+./scripts/make_release.sh
+```
+
+It shows the current version, offers the next patch/minor/major or a custom one,
+edits `Cargo.toml`, refreshes `Cargo.lock`, offers to move the changelog entries
+under the new heading, and offers to commit. Take its tag prompt only if you know
+why; step 5 explains the ordering.
+
+Then run the checks:
 
 ```sh
 cargo check
@@ -60,8 +71,8 @@ git diff -- Cargo.toml Cargo.lock
 Keep `Cargo.lock` committed. Review unexpected dependency changes; a version bump
 does not require a general `cargo update`.
 
-Stage `Cargo.toml`, `Cargo.lock`, and any release documentation changes explicitly,
-then commit:
+If you declined the script's commit prompt, stage `Cargo.toml`, `Cargo.lock`,
+`CHANGELOG.md`, and any release documentation changes explicitly, then commit:
 
 ```sh
 git add Cargo.toml Cargo.lock CHANGELOG.md

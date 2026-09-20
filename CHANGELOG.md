@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `scripts/make_release.sh`, an interactive helper that bumps the version, updates the changelog, and optionally commits and tags.
+
 - Add Flares as an alert destination. Configure it under `alert.flares`; alerts continue to run alongside any configured `alert.command` and Pushover destinations.
 - Upgrade rusqlite to 0.40.2, retaining bundled SQLite.
 - Update the Rust dependency group, including axum, reqwest, tokio, and uuid.

@@ -21,13 +21,20 @@ die() {
     exit 1
 }
 
-# confirm <prompt> <default: y|n>; returns 0 for yes.
+# confirm <prompt>; returns 0 for yes, 1 for no. There is no default: the answer must
+# be y, yes, n or no, in any case, and anything else asks again. A closed stdin answers
+# no, so a non-interactive run never takes a publishing or tagging step by falling
+# through.
 confirm() {
-    local prompt=$1 default=$2 reply hint
-    if [ "$default" = y ]; then hint='[Y/n]'; else hint='[y/N]'; fi
-    read -r -p "$prompt $hint " reply
-    reply=${reply:-$default}
-    [[ $reply =~ ^[Yy]$ ]]
+    local prompt=$1 reply
+    while true; do
+        read -r -p "$prompt [y/n] " reply || return 1
+        case $reply in
+        [Yy] | [Yy][Ee][Ss]) return 0 ;;
+        [Nn] | [Nn][Oo]) return 1 ;;
+        esac
+        printf 'Please answer y or n.\n'
+    done
 }
 
 current_version() {
@@ -79,7 +86,7 @@ if [ -n "$(git status --porcelain)" ]; then
     printf '\nThe working tree has uncommitted changes:\n\n'
     git status --short
     printf '\n'
-    confirm 'Continue anyway?' n || exit 0
+    confirm 'Continue anyway?' || exit 0
 fi
 
 printf '\nSetting version %s ...\n\n' "$target"
@@ -89,17 +96,19 @@ cargo check --quiet
 printf 'Cargo.toml and Cargo.lock updated.\n'
 
 changelog_heading="## $target - $(date +%F)"
-if grep -q '^## Unreleased$' CHANGELOG.md &&
-    confirm $'\n'"Move the CHANGELOG \"Unreleased\" entries under $target?" y; then
-    sed -i "0,/^## Unreleased$/s//## Unreleased\n\n$changelog_heading/" CHANGELOG.md
-    printf 'CHANGELOG.md: entries moved under %s\n' "${changelog_heading#\#\# }"
+if grep -q '^## Unreleased$' CHANGELOG.md; then
+    printf '\n'
+    if confirm "Move the CHANGELOG \"Unreleased\" entries under $target?"; then
+        sed -i "0,/^## Unreleased$/s//## Unreleased\n\n$changelog_heading/" CHANGELOG.md
+        printf 'CHANGELOG.md: entries moved under %s\n' "${changelog_heading#\#\# }"
+    fi
 fi
 
 printf '\nChanged files:\n\n'
 git status --short
 printf '\n'
 
-if confirm "Commit as \"$RELEASE_NAME $target\"?" y; then
+if confirm "Commit as \"$RELEASE_NAME $target\"?"; then
     git add -A
     git commit -q -m "$RELEASE_NAME $target"
     printf 'Committed %s\n' "$(git rev-parse --short HEAD)"
@@ -122,11 +131,11 @@ else
     if [ -n "$upstream" ] && [ -n "$(git log --oneline "$upstream"..HEAD)" ]; then
         printf '\nNote: HEAD is ahead of %s. Publishing a commit that is not pushed\n' "$upstream"
         printf 'leaves the registry pointing at source nobody else can fetch.\n'
-        confirm 'Push it now?' y && git push
+        confirm 'Push it now?' && git push
     fi
 
     printf '\n%s\n' "$PUBLISH_WARNING"
-    if confirm "Publish $RELEASE_NAME $target to crates.io?" n; then
+    if confirm "Publish $RELEASE_NAME $target to crates.io?"; then
         cargo publish --workspace --locked --registry crates-io
         published=1
         printf '\nPublished %s %s.\n' "$RELEASE_NAME" "$target"
@@ -135,15 +144,12 @@ else
     fi
 fi
 
-if [ "$published" -eq 1 ]; then
-    tag_default=y
-else
-    tag_default=n
+if [ "$published" -eq 0 ]; then
     printf '\nNothing was published, so a tag would name a release that is not on the\n'
     printf 'registry. The documented order is publish first, then tag.\n\n'
 fi
 
-if confirm "Create tag $tag?" "$tag_default"; then
+if confirm "Create tag $tag?"; then
     git tag -a "$tag" -m "$RELEASE_NAME $target"
     printf '\nCreated %s locally. It is not pushed.\n' "$tag"
     printf '  push:   git push origin %s\n' "$tag"

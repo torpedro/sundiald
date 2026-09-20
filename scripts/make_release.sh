@@ -2,14 +2,17 @@
 # Interactive release helper for sundiald.
 #
 # Shows the current version, prompts for the next one, updates every file that
-# records it, and optionally updates the changelog, commits, and tags.
-# Publishing is separate and manual; see docs/releases.md.
+# records it, then optionally updates the changelog, commits, verifies and publishes
+# to crates.io, and tags. Every step is a prompt, and nothing is pushed or published
+# without one; see docs/releases.md.
 
 set -euo pipefail
 
 PROJECT_NAME="sundiald"
 # Used for both the release commit subject and the tag message.
 RELEASE_NAME="sundiald"
+PUBLISH_WARNING="This uploads sundiald to crates.io. Published versions are permanent:
+they cannot be replaced or deleted, only yanked."
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -104,11 +107,43 @@ else
     printf 'Left uncommitted. A tag would not include these changes.\n'
 fi
 
-printf '\nThe documented process publishes to crates.io before tagging, so that a tag\n'
-printf 'only ever names a release that reached the registry.\n'
-printf 'See docs/releases.md steps 4 and 5.\n\n'
+# Publishing needs a committed tree: cargo refuses to package uncommitted changes,
+# and a published version must correspond to a commit that exists.
+published=0
+if [ -n "$(git status --porcelain)" ]; then
+    printf '\nWorking tree is not clean, so the package cannot be verified or published.\n'
+    printf 'Commit the changes, then follow docs/releases.md from step 3.\n'
+else
+    printf '\nVerifying the package ...\n\n'
+    cargo publish --workspace --dry-run --locked --registry crates-io ||
+        die "packaging failed; fix it before publishing"
 
-if confirm "Create tag $tag now anyway?" n; then
+    upstream=$(git rev-parse --abbrev-ref '@{upstream}' 2>/dev/null || true)
+    if [ -n "$upstream" ] && [ -n "$(git log --oneline "$upstream"..HEAD)" ]; then
+        printf '\nNote: HEAD is ahead of %s. Publishing a commit that is not pushed\n' "$upstream"
+        printf 'leaves the registry pointing at source nobody else can fetch.\n'
+        confirm 'Push it now?' y && git push
+    fi
+
+    printf '\n%s\n' "$PUBLISH_WARNING"
+    if confirm "Publish $RELEASE_NAME $target to crates.io?" n; then
+        cargo publish --workspace --locked --registry crates-io
+        published=1
+        printf '\nPublished %s %s.\n' "$RELEASE_NAME" "$target"
+    else
+        printf '\nNot published. Resume at docs/releases.md step 4.\n'
+    fi
+fi
+
+if [ "$published" -eq 1 ]; then
+    tag_default=y
+else
+    tag_default=n
+    printf '\nNothing was published, so a tag would name a release that is not on the\n'
+    printf 'registry. The documented order is publish first, then tag.\n\n'
+fi
+
+if confirm "Create tag $tag?" "$tag_default"; then
     git tag -a "$tag" -m "$RELEASE_NAME $target"
     printf '\nCreated %s locally. It is not pushed.\n' "$tag"
     printf '  push:   git push origin %s\n' "$tag"
@@ -119,4 +154,4 @@ else
         "$tag" "$RELEASE_NAME" "$target" "$tag"
 fi
 
-printf '\nNext: docs/releases.md step 3 (verify the package).\n\n'
+printf '\nNext: docs/releases.md, from the first step this run did not cover.\n\n'

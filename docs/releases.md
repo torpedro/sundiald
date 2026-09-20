@@ -55,8 +55,9 @@ Set the version and update the changelog in one step:
 
 It shows the current version, offers the next patch/minor/major or a custom one,
 edits `Cargo.toml`, refreshes `Cargo.lock`, offers to move the changelog entries
-under the new heading, and offers to commit. Take its tag prompt only if you know
-why; step 5 explains the ordering.
+under the new heading, and offers to commit. It then runs the packaging dry run from
+step 3 and offers to publish (step 4) and tag (step 5), in that order, so you can
+drive the whole release from it or stop at any prompt.
 
 Then run the checks:
 

@@ -76,7 +76,7 @@ If you declined the script's commit prompt, stage `Cargo.toml`, `Cargo.lock`,
 
 ```sh
 git add Cargo.toml Cargo.lock CHANGELOG.md
-git commit -m "Release 0.1.1"
+git commit -m "sundiald 0.1.1"
 git status --short
 ```
 

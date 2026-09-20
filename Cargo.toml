@@ -1,6 +1,6 @@
 [package]
 name = "sundiald"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A job scheduler and service runner with a terminal UI"
 license = "MIT"

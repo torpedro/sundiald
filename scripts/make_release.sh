@@ -8,7 +8,8 @@
 set -euo pipefail
 
 PROJECT_NAME="sundiald"
-TAG_MESSAGE_PREFIX="sundiald"
+# Used for both the release commit subject and the tag message.
+RELEASE_NAME="sundiald"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
@@ -95,9 +96,9 @@ printf '\nChanged files:\n\n'
 git status --short
 printf '\n'
 
-if confirm "Commit as \"Release $target\"?" y; then
+if confirm "Commit as \"$RELEASE_NAME $target\"?" y; then
     git add -A
-    git commit -q -m "Release $target"
+    git commit -q -m "$RELEASE_NAME $target"
     printf 'Committed %s\n' "$(git rev-parse --short HEAD)"
 else
     printf 'Left uncommitted. A tag would not include these changes.\n'
@@ -108,14 +109,14 @@ printf 'only ever names a release that reached the registry.\n'
 printf 'See docs/releases.md steps 4 and 5.\n\n'
 
 if confirm "Create tag $tag now anyway?" n; then
-    git tag -a "$tag" -m "$TAG_MESSAGE_PREFIX $target"
+    git tag -a "$tag" -m "$RELEASE_NAME $target"
     printf '\nCreated %s locally. It is not pushed.\n' "$tag"
     printf '  push:   git push origin %s\n' "$tag"
     printf '  undo:   git tag -d %s\n' "$tag"
 else
     printf '\nNo tag created. After publishing:\n'
     printf '  git tag -a %s -m "%s %s" && git push origin %s\n' \
-        "$tag" "$TAG_MESSAGE_PREFIX" "$target" "$tag"
+        "$tag" "$RELEASE_NAME" "$target" "$tag"
 fi
 
 printf '\nNext: docs/releases.md step 3 (verify the package).\n\n'

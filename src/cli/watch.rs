@@ -27,6 +27,10 @@ use tokio::{
 use super::client::{api_base, api_client, authorize, encode_path_segment, fetch_status};
 use crate::{client_config::ClientConfig, service, state};
 
+// Match SQLens's terminal-native accent, muted chrome, and selection palette.
+const ACCENT: Color = Color::Cyan;
+const MUTED: Color = Color::DarkGray;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailMode {
     Summary,
@@ -914,22 +918,24 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &ClientConfig, state: 
     let title = Line::from(vec![
         Span::styled(
             "sundiald",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
         connection,
-        Span::styled(refreshed, Style::default().fg(Color::DarkGray)),
+        Span::styled(refreshed, Style::default().fg(MUTED)),
         Span::raw(if area.width >= 100 {
             format!("  {}  ", api_base(config))
         } else {
             "  ".to_string()
         }),
-        Span::styled(&state.message, Style::default().fg(Color::Gray)),
+        Span::styled(&state.message, Style::default().fg(ACCENT)),
     ]);
     frame.render_widget(
-        Paragraph::new(title).block(Block::default().borders(Borders::ALL)),
+        Paragraph::new(title).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(MUTED)),
+        ),
         area,
     );
 }
@@ -1023,14 +1029,14 @@ fn draw_jobs(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         )
     };
     let table = Table::new(rows, constraints)
-        .header(Row::new(headers).style(Style::default().add_modifier(Modifier::BOLD)))
+        .header(Row::new(headers).style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)))
         .block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
                 .border_style(focus_border_style(state.focus == Focus::Table)),
         )
-        .row_highlight_style(Style::default().bg(Color::Indexed(236)))
+        .row_highlight_style(Style::default().fg(Color::Black).bg(ACCENT))
         .highlight_symbol("> ");
 
     let mut table_state = TableState::default().with_selected(selected_row);
@@ -1072,11 +1078,8 @@ fn push_section_rows(
         format!("{title}  {visible_count}")
     };
     rows.push(
-        Row::new(section_cells(section_title, column_mode)).style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
+        Row::new(section_cells(section_title, column_mode))
+            .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
     );
     *row_index += 1;
 
@@ -1101,7 +1104,7 @@ fn push_section_rows(
                     format!("  {marker} {group}  {}", entries.len()),
                     column_mode,
                 ))
-                .style(Style::default().fg(Color::Cyan)),
+                .style(Style::default().fg(ACCENT)),
             );
             *row_index += 1;
         }
@@ -1179,17 +1182,17 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .constraints([Constraint::Length(1), Constraint::Min(1)])
         .split(inner);
     let tabs = Tabs::new(["Summary", "Log", "History", "Schedule"])
+        .style(Style::default().fg(MUTED))
         .select(state.detail_mode.index())
-        .highlight_style(
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
+        .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .divider(" | ");
     frame.render_widget(tabs, chunks[0]);
 
     if state.detail_loading {
-        frame.render_widget(Paragraph::new("Loading..."), chunks[1]);
+        frame.render_widget(
+            Paragraph::new("Loading...").style(Style::default().fg(MUTED)),
+            chunks[1],
+        );
         return;
     }
     if let Some(error) = &state.detail_error {
@@ -1240,7 +1243,8 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 fn draw_summary(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let Some(entry) = state.selected_entry() else {
         frame.render_widget(
-            Paragraph::new("No runnable matches the current view."),
+            Paragraph::new("No runnable matches the current view.")
+                .style(Style::default().fg(MUTED)),
             area,
         );
         return;
@@ -1283,7 +1287,8 @@ fn draw_summary(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
 fn draw_history_table(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
     let Some(history) = &state.detail_history else {
         frame.render_widget(
-            Paragraph::new("No history is available for this runnable."),
+            Paragraph::new("No history is available for this runnable.")
+                .style(Style::default().fg(MUTED)),
             area,
         );
         return;
@@ -1331,7 +1336,7 @@ fn draw_history_table(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         Row::new([
             "ID", "Started", "Trigger", "Status", "Exit", "Duration", "Error",
         ])
-        .style(Style::default().add_modifier(Modifier::BOLD)),
+        .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
     );
     frame.render_widget(table, area);
 }
@@ -1354,10 +1359,7 @@ fn draw_footer(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         });
         format!("? help  {actions}  R reload  x dismiss  q quit")
     };
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(Color::Gray)),
-        area,
-    );
+    frame.render_widget(Paragraph::new(text), area);
 }
 
 fn group_entries(state: &UiState, kind: EntryKind) -> Vec<(Option<String>, Vec<&UiEntry>)> {
@@ -1399,7 +1401,12 @@ fn draw_confirmation(frame: &mut Frame<'_>, name: &str) {
         Paragraph::new(format!(
             "Send SIGKILL to {name}?\n\n[y] Kill    [n/Esc] Cancel"
         ))
-        .block(Block::default().title("Confirm kill").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title("Confirm kill")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(ACCENT)),
+        )
         .style(Style::default().fg(Color::Red)),
         area,
     );
@@ -1428,7 +1435,8 @@ fn draw_help(frame: &mut Frame<'_>) {
             .block(
                 Block::default()
                     .title("Keyboard help")
-                    .borders(Borders::ALL),
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT)),
             )
             .wrap(Wrap { trim: false }),
         area,
@@ -1480,13 +1488,7 @@ fn compact_status(entry: &UiEntry) -> String {
 }
 
 fn focus_border_style(focused: bool) -> Style {
-    if focused {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    }
+    Style::default().fg(if focused { ACCENT } else { MUTED })
 }
 
 fn status_cell(entry: &UiEntry) -> Cell<'static> {

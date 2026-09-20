@@ -2,6 +2,16 @@
 
 `sundiald` is a small Rust job and service runner. It reads a YAML config, starts shell commands on schedules or by request, captures stdout/stderr to disk, records state for inspection, logs lifecycle events to stdout and its own log file, and writes alerts for failed jobs or unexpected service exits.
 
+## Install
+
+Install from crates.io with Rust and Cargo:
+
+```sh
+cargo install sundiald --locked
+```
+
+For the commands below, replace `cargo run --` with `sundiald` when using the installed binary.
+
 ## Build
 
 ```sh
@@ -138,7 +148,7 @@ services:
       stop: "0 0 18 * * mon-fri"
 ```
 
-See [examples/maintenance.yaml](/home/pedro/sundiald.git/examples/maintenance.yaml) for a complete external jobs file.
+See [examples/maintenance.yaml](examples/maintenance.yaml) for a complete external jobs file.
 
 Relative `job_files.path` values are resolved relative to the main config file. Jobs and services loaded from a job file keep the file's `name` as their `group` in the HTTP status response, and inherit any environment variables from that file's optional top-level `env` map. Missing UUIDs are written back to the file that defined the entry, not necessarily the main config.
 

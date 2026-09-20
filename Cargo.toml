@@ -2,6 +2,12 @@
 name = "sundiald"
 version = "0.1.0"
 edition = "2024"
+description = "A job scheduler and service runner with a terminal UI"
+license = "MIT"
+repository = "https://github.com/torpedro/sundiald"
+readme = "README.md"
+keywords = ["scheduler", "cron", "daemon", "services"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0"

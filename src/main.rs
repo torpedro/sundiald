@@ -164,6 +164,9 @@ async fn main() -> Result<()> {
             if config.alert.pushover.is_some() {
                 println!("alert.pushover: configured");
             }
+            if config.alert.flares.is_some() {
+                println!("alert.flares: configured");
+            }
             println!("job_files: {}", config.job_files.len());
             for job_file in &config.job_files {
                 println!("- {}: {}", job_file.name, job_file.path.display());

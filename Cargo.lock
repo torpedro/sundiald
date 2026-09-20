@@ -479,6 +479,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "flares-client"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c2e53f6090f1b257e6e4570aff7ecb10fae82c2ff9faefe416ce43d1b760abdf"
+dependencies = [
+ "flares-types",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "flares-types"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad099754922b9204850c8f3b9b17d7602275e187f023eb62dac5ae7b7c6a40cb"
+dependencies = [
+ "chrono",
+ "serde",
+]
+
+[[package]]
 name = "foldhash"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1705,6 +1728,7 @@ dependencies = [
  "clap",
  "colored",
  "crossterm",
+ "flares-client",
  "libc",
  "ratatui",
  "reqwest",

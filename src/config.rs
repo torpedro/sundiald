@@ -100,6 +100,19 @@ pub struct AlertConfig {
     pub command: Option<AlertCommandConfig>,
     #[serde(default)]
     pub pushover: Option<PushoverConfig>,
+    #[serde(default)]
+    pub flares: Option<FlaresConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FlaresConfig {
+    pub url: String,
+    pub token: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub severity: flares_client::Severity,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -419,6 +432,20 @@ impl SundialdConfig {
                 if !(-2..=2).contains(&priority) {
                     bail!("alert.pushover.priority must be between -2 and 2");
                 }
+            }
+        }
+
+        if let Some(flares) = &self.alert.flares {
+            flares_client::ApiClient::new(&flares.url, &flares.token)
+                .context("invalid alert.flares configuration")?;
+            if flares
+                .title
+                .as_ref()
+                .is_some_and(|title| title.trim().is_empty() || title.chars().count() > 250)
+            {
+                bail!(
+                    "alert.flares.title must contain between 1 and 250 characters and not be blank"
+                );
             }
         }
 
@@ -745,6 +772,7 @@ impl Default for AlertConfig {
             retention_days: default_alert_retention_days(),
             command: None,
             pushover: None,
+            flares: None,
         }
     }
 }
@@ -787,6 +815,12 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
+  # Optional Flares output. Credentials are read from this config file.
+  # flares:
+  #   url: "http://127.0.0.1:8000"
+  #   token: "your-flares-api-token"
+  #   title: "sundiald"
+  #   severity: warning
 # Environment variables inherited by inline jobs and services in this file.
 env:
   APP_ENV: production
@@ -836,6 +870,63 @@ services:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_accepts_flares_and_other_alert_outputs() {
+        let config: SundialdConfig = serde_yaml::from_str(
+            r#"
+alert:
+  flares:
+    url: https://flares.example.com
+    token: test-token
+  pushover:
+    token: app-token
+    user: user-key
+  command:
+    program: /bin/true
+"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let flares = config.alert.flares.unwrap();
+        assert_eq!(flares.severity, flares_client::Severity::Warning);
+        assert!(flares.title.is_none());
+        assert!(config.alert.pushover.is_some());
+        assert!(config.alert.command.is_some());
+        assert!(AlertConfig::default().flares.is_none());
+    }
+
+    #[test]
+    fn config_rejects_invalid_flares_settings() {
+        for settings in [
+            "url: ftp://example.com\n    token: test-token",
+            "url: https://user:secret@example.com\n    token: test-token",
+            "url: https://example.com?token=secret\n    token: test-token",
+            "url: https://example.com\n    token: ''",
+            "url: https://example.com\n    token: 'bad token'",
+            "url: https://example.com\n    token: test-token\n    title: ' '",
+        ] {
+            let config: SundialdConfig =
+                serde_yaml::from_str(&format!("alert:\n  flares:\n    {settings}\n")).unwrap();
+            assert!(config.validate().is_err(), "accepted {settings}");
+        }
+        for field in [
+            "severity: invalid".to_string(),
+            "unexpected: true".to_string(),
+        ] {
+            assert!(serde_yaml::from_str::<SundialdConfig>(
+                &format!("alert:\n  flares:\n    url: https://example.com\n    token: test-token\n    {field}\n")
+            ).is_err());
+        }
+        let mut config: SundialdConfig = serde_yaml::from_str("{}").unwrap();
+        config.alert.flares = Some(FlaresConfig {
+            url: "https://example.com".into(),
+            token: "test-token".into(),
+            title: Some("é".repeat(251)),
+            severity: flares_client::Severity::Critical,
+        });
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn config_accepts_pushover_alert_output() {

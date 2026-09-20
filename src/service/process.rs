@@ -727,6 +727,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job = JobConfig {
             uuid: Some(Uuid::new_v4()),
@@ -780,6 +781,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let job = JobConfig {
@@ -845,6 +847,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let mut env = HashMap::new();
@@ -902,6 +905,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let job = JobConfig {
@@ -970,6 +974,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let job = JobConfig {
@@ -1035,6 +1040,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let history = HistoryDb::open(temp.path()).await.unwrap();
         let state = Arc::new(Mutex::new(StateSnapshot::new(Vec::new())));
@@ -1076,6 +1082,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let job = JobConfig {
@@ -1141,6 +1148,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let job = JobConfig {
@@ -1197,6 +1205,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let job = JobConfig {
@@ -1261,6 +1270,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
         let job_id = Uuid::new_v4();
         let job = JobConfig {

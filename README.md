@@ -59,6 +59,12 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
+  # Optional Flares output. Credentials are read from this config file.
+  # flares:
+  #   url: "http://127.0.0.1:8000"
+  #   token: "your-flares-api-token"
+  #   title: "sundiald"
+  #   severity: warning
 # Environment variables inherited by inline jobs and services in this file.
 env:
   APP_ENV: production
@@ -110,7 +116,11 @@ Job and service `command` strings are executed through `sh -c`, so standard shel
 
 If both day-of-week and day-of-month are restricted (not left as `*`), a day matches when *either* is satisfied, matching standard cron semantics — e.g. `0 0 9 1 * mon` runs at 09:00:00 on the 1st of the month *or* on Mondays, not only on a Monday that happens to be the 1st. If only one of the two is restricted, only that one applies.
 
-Failures are appended to `alert.log` and also written as JSON files under `alert.event_dir`. If `alert.command` is present, sundiald runs that configured program with configured args. If `alert.pushover` is present, sundiald sends the alert to Pushover using the configured application token and user/group key. Sundiald does not pass alert data through environment variables. A failure to deliver to `alert.command` or Pushover is logged to stderr but does not itself generate another alert.
+Failures are appended to `alert.log` and also written as JSON files under `alert.event_dir`. If `alert.command` is present, sundiald runs that configured program with configured args. If `alert.pushover` is present, sundiald sends the alert to Pushover using the configured application token and user/group key. Sundiald does not pass alert data through environment variables.
+
+If `alert.flares` is present, sundiald sends a one-shot alert through `flares-client` to the configured Flares server. `url` and `token` are required; `title` defaults to `sundiald: <job-name>`, and `severity` defaults to `warning` (also accepts `info` or `critical`). Each message starts with the job or service name. Flares requests time out after 15 seconds and are not retried automatically. Pending deliveries are accepted for processing; other unsuccessful delivery statuses are logged. Titles and messages are truncated to Flares’ limits of 250 and 1024 Unicode characters; the local event retains the full message.
+
+A failure to deliver to `alert.command`, Pushover, or Flares is logged to stderr but does not itself generate another alert.
 
 Set a job's optional `alert_if_running_for_longer_than` (e.g. `"45s"`, `"10m"`, `"2h"`, `"1d"`, or a compound value like `"1h30m"`) to fire the same alert channels once if a run is still active past that threshold — useful for catching a job that's hung or unexpectedly slow. It fires at most once per run (not repeated for the rest of that run) and doesn't affect the job itself; it keeps running either way.
 

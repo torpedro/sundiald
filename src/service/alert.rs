@@ -9,7 +9,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
-use crate::config::{AlertCommandConfig, AlertConfig, PushoverConfig};
+use crate::config::{AlertCommandConfig, AlertConfig, FlaresConfig, PushoverConfig};
 
 #[derive(Debug, Serialize)]
 struct AlertEvent<'a> {
@@ -19,7 +19,7 @@ struct AlertEvent<'a> {
 }
 
 /// Writes the durable alert record (log line + JSON event file) for a job
-/// failure, then best-effort forwards it to the optional command/Pushover
+/// failure, then best-effort forwards it to the optional command/Pushover/Flares
 /// notification channels. Notification-channel failures are logged to
 /// stderr but do not return an error: they are not the same kind of failure
 /// as the job itself failing, and propagating them up causes the caller to
@@ -75,7 +75,46 @@ async fn write_alert_inner(alert: &AlertConfig, job_name: &str, message: &str) -
             eprintln!("failed to send Pushover alert for job '{job_name}': {error:#}");
         }
     }
+    if let Some(flares) = &alert.flares
+        && let Err(error) = send_flares_alert(flares, job_name, message).await
+    {
+        eprintln!("failed to send Flares alert for job '{job_name}': {error:#}");
+    }
     Ok(())
+}
+
+async fn send_flares_alert(flares: &FlaresConfig, job_name: &str, message: &str) -> Result<()> {
+    let client = flares_client::ApiClient::new(&flares.url, &flares.token)
+        .context("failed to build Flares HTTP client")?;
+    // Flares limits title/message lengths in Unicode characters. The durable
+    // local event retains the full text if a notification needs truncation.
+    let title = flares
+        .title
+        .clone()
+        .unwrap_or_else(|| format!("sundiald: {job_name}"));
+    let request = flares_client::Alert {
+        title: title.chars().take(250).collect(),
+        message: format!("{job_name}: {message}")
+            .chars()
+            .take(1024)
+            .collect(),
+        severity: flares.severity,
+        group_key: None,
+    };
+    let result = client
+        .alert(request, Some(Uuid::new_v4().to_string()))
+        .await
+        .context("failed to send Flares alert")?;
+    match result.notification.status {
+        flares_client::NotificationStatus::Sent | flares_client::NotificationStatus::Pending => {
+            Ok(())
+        }
+        status => anyhow::bail!(
+            "Flares delivery {} returned status {}",
+            result.delivery_id,
+            status.as_str()
+        ),
+    }
 }
 
 async fn run_alert_command(
@@ -204,6 +243,129 @@ mod tests {
     use super::*;
     use crate::config::AlertConfig;
 
+    async fn flares_server(
+        status: axum::http::StatusCode,
+        response: serde_json::Value,
+    ) -> (
+        FlaresConfig,
+        tokio::sync::mpsc::UnboundedReceiver<(axum::http::HeaderMap, serde_json::Value)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/v1/alerts",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap,
+                      axum::Json(body): axum::Json<serde_json::Value>| {
+                    let tx = tx.clone();
+                    let response = response.clone();
+                    async move {
+                        tx.send((headers, body)).unwrap();
+                        (status, axum::Json(response))
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = FlaresConfig {
+            url: format!("http://{}", listener.local_addr().unwrap()),
+            token: "test-token".into(),
+            title: None,
+            severity: flares_client::Severity::Warning,
+        };
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (config, rx, server)
+    }
+
+    #[tokio::test]
+    async fn flares_sends_authenticated_alerts_and_accepts_pending_delivery() {
+        for status in ["sent", "pending"] {
+            let (mut config, mut requests, server) = flares_server(
+                axum::http::StatusCode::OK,
+                serde_json::json!({"delivery_id": 42, "notification": {"status": status, "error": null}}),
+            ).await;
+            send_flares_alert(&config, "backup", "exited with status 42")
+                .await
+                .unwrap();
+            let (headers, body) = requests.recv().await.unwrap();
+            assert_eq!(headers["authorization"], "Bearer test-token");
+            let first_key = headers["idempotency-key"].to_str().unwrap();
+            assert!(Uuid::parse_str(first_key).is_ok());
+            assert_eq!(body["title"], "sundiald: backup");
+            assert_eq!(body["message"], "backup: exited with status 42");
+            assert_eq!(body["severity"], "warning");
+            assert!(body["group_key"].is_null());
+
+            config.title = Some("Custom title".into());
+            config.severity = flares_client::Severity::Critical;
+            send_flares_alert(&config, "backup", &"é".repeat(1500))
+                .await
+                .unwrap();
+            let (headers, body) = requests.recv().await.unwrap();
+            assert_ne!(headers["idempotency-key"], first_key);
+            assert_eq!(body["title"], "Custom title");
+            assert_eq!(body["severity"], "critical");
+            assert_eq!(body["message"].as_str().unwrap().chars().count(), 1024);
+            config.title = None;
+            send_flares_alert(&config, &"é".repeat(300), "failed")
+                .await
+                .unwrap();
+            let (_, body) = requests.recv().await.unwrap();
+            assert_eq!(body["title"].as_str().unwrap().chars().count(), 250);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn flares_reports_delivery_and_http_failures_without_duplicate_events() {
+        for (http_status, status) in [
+            (axum::http::StatusCode::OK, "failed"),
+            (axum::http::StatusCode::OK, "unknown"),
+            (axum::http::StatusCode::OK, "not_attempted"),
+            (axum::http::StatusCode::UNAUTHORIZED, "failed"),
+            (axum::http::StatusCode::INTERNAL_SERVER_ERROR, "failed"),
+            (axum::http::StatusCode::OK, "invalid-status"),
+        ] {
+            let (config, mut requests, server) = flares_server(http_status,
+                serde_json::json!({"delivery_id": 42, "notification": {"status": status, "error": "private-response"}})
+            ).await;
+            let error = send_flares_alert(&config, "backup", "failed")
+                .await
+                .unwrap_err();
+            let error = format!("{error:#}");
+            assert!(!error.contains("test-token"));
+            assert!(!error.contains("private-response"));
+            requests.recv().await.unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let alert = AlertConfig {
+                log: temp.path().join("alerts.log"),
+                event_dir: temp.path().join("events"),
+                flares: Some(config),
+                ..AlertConfig::default()
+            };
+            write_alert_inner(&alert, "backup", "failed").await.unwrap();
+            requests.recv().await.unwrap();
+            assert!(requests.try_recv().is_err());
+            assert_eq!(
+                fs::read_to_string(&alert.log)
+                    .await
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1
+            );
+            let mut events = fs::read_dir(&alert.event_dir).await.unwrap();
+            let event = events.next_entry().await.unwrap().unwrap();
+            let body: serde_json::Value =
+                serde_json::from_slice(&fs::read(event.path()).await.unwrap()).unwrap();
+            assert_eq!(body["message"], "failed");
+            assert!(events.next_entry().await.unwrap().is_none());
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn write_alert_keeps_multiple_events_for_same_job_in_same_second() {
         let temp = tempfile::tempdir().unwrap();
@@ -213,6 +375,7 @@ mod tests {
             retention_days: 0,
             command: None,
             pushover: None,
+            flares: None,
         };
 
         write_alert(&alert, "same-job", "first").await;

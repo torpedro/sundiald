@@ -27,6 +27,12 @@ alert:
   #   user: "your-pushover-user-or-group-key"
   #   title: "sundiald"
   #   priority: 0
+  # Optional Flares output. Credentials are read from this config file.
+  # flares:
+  #   url: "http://127.0.0.1:8000"
+  #   token: "your-flares-api-token"
+  #   title: "sundiald"
+  #   severity: warning
 # Environment variables inherited by inline jobs and services in this file.
 env:
   APP_ENV: production

@@ -60,9 +60,13 @@ sudo systemctl status sundiald
 Use the installed binary to inspect or control the running service:
 
 ```sh
-sundiald ui --config /etc/sundiald/sundiald.yaml
-sundiald reload --config /etc/sundiald/sundiald.yaml
-sundiald run heartbeat --config /etc/sundiald/sundiald.yaml
+sundiald ui
+sundiald reload
+sundiald run heartbeat
 ```
+
+These commands connect to the default local API without reading the system
+configuration. For another address or authentication, supply a separate
+[client configuration](client-configuration.md).
 
 View service logs with `journalctl -u sundiald -f`. Per-job stdout and stderr logs are written under per-job directories in the configured `log_dir`, and alert events are written under `alert.event_dir`.

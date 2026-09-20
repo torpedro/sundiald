@@ -18,7 +18,7 @@ For the commands below, replace `cargo run --` with `sundiald` when using the in
 cargo run -- daemon
 ```
 
-When `--config` is not supplied, sundiald reads `~/.config/sundiald/config.yaml`. Pass `--config <path>` to use a different config file.
+The daemon selects an explicit `--config <path>` or `SUNDIALD_CONFIG` first, then the user file at `$XDG_CONFIG_HOME/sundiald/config.yaml` (or `~/.config/sundiald/config.yaml` when XDG is unset or invalid), then `/etc/sundiald/config.yaml`. Client commands use the same discovery order with `--client-config`, `SUNDIALD_CLIENT_CONFIG`, and the filename `client.yaml`.
 
 Job state (status, last run, exit code) persists atomically in `state_dir/state.json` and is reloaded on startup, so `status` reflects history across restarts. A job that was `running` when the service last stopped is marked `interrupted`, since its process died with the previous instance and its actual outcome is unknown. On Unix, if sundiald sees that the previous run's process group is still present during startup, it writes an alert for the orphaned process group but does not kill it automatically.
 
@@ -33,6 +33,11 @@ Reloads the config from disk without restarting — this picks up job/schedule/l
 When the daemon shuts down, it sends SIGTERM to running jobs and services, waits up to `shutdown_grace_period` for jobs and up to each service's `stop_grace_period` when set, then escalates any remaining process groups to SIGKILL. This lets stdout/stderr logs, state, and SQLite history finish cleanly before the daemon exits.
 
 ## Use the CLI
+
+Client commands default to `http://127.0.0.1:8787` without reading the daemon's
+configuration. Use `--url`, `--client-config`, or a user `client.yaml` for another
+server or authentication. Run `sundiald client-config` to inspect resolved
+connection settings. See [client configuration and migration](docs/client-configuration.md).
 
 ```sh
 cargo run -- config
@@ -61,6 +66,7 @@ The HTTP API uses JSON and bearer authentication when `api_bind` is not a loopba
 address.
 
 - [Configuration](docs/configuration.md) — the YAML format, job files, and environment.
+- [Client connections](docs/client-configuration.md) — URLs, tokens, overrides, and migration.
 - [HTTP API](docs/api.md) — endpoints and curl examples.
 - [Running under systemd](docs/systemd.md) — service user, unit file, and log handling.
 - [Development](docs/development.md) — building and running tests.

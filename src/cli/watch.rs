@@ -25,7 +25,7 @@ use tokio::{
 };
 
 use super::client::{api_base, api_client, authorize, encode_path_segment, fetch_status};
-use crate::{config::SundialdConfig, service, state};
+use crate::{client_config::ClientConfig, service, state};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DetailMode {
@@ -356,7 +356,7 @@ enum UiEvent {
     },
 }
 
-pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
+pub(crate) async fn watch_status(config: ClientConfig) -> Result<()> {
     let mut terminal = WatchTerminal::enter()?;
     let mut state = UiState::new();
     let mut interval = time::interval(Duration::from_secs(1));
@@ -407,7 +407,7 @@ pub(crate) async fn watch_status(config: SundialdConfig) -> Result<()> {
 
 fn handle_key(
     key: KeyEvent,
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
@@ -647,7 +647,7 @@ fn handle_key(
 
 fn handle_search_key(
     key: KeyEvent,
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
 ) -> bool {
@@ -668,7 +668,7 @@ fn handle_search_key(
 }
 
 fn request_status(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
@@ -688,7 +688,7 @@ fn request_status(
 
 fn handle_ui_event(
     event: UiEvent,
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
@@ -754,7 +754,7 @@ fn handle_ui_event(
 }
 
 fn switch_detail(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
     amount: isize,
@@ -771,7 +771,7 @@ fn switch_detail(
 }
 
 fn selection_changed(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
@@ -786,7 +786,7 @@ fn selection_changed(
 }
 
 fn request_selected_detail(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
 ) {
@@ -815,7 +815,7 @@ fn request_selected_detail(
 }
 
 fn start_action(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
     uuid: Option<uuid::Uuid>,
@@ -842,7 +842,7 @@ fn start_action(
 }
 
 fn start_kill(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     state: &mut UiState,
     event_tx: &mpsc::UnboundedSender<UiEvent>,
     uuid: uuid::Uuid,
@@ -867,7 +867,7 @@ fn start_kill(
     );
 }
 
-fn draw_ui(frame: &mut Frame<'_>, config: &SundialdConfig, state: &UiState) {
+fn draw_ui(frame: &mut Frame<'_>, config: &ClientConfig, state: &UiState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -901,7 +901,7 @@ fn draw_ui(frame: &mut Frame<'_>, config: &SundialdConfig, state: &UiState) {
     }
 }
 
-fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &SundialdConfig, state: &UiState) {
+fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &ClientConfig, state: &UiState) {
     let connection = if state.connected {
         Span::styled("● connected", Style::default().fg(Color::Green))
     } else {
@@ -1618,7 +1618,7 @@ fn render_schedule(entry: &UiEntry) -> String {
 }
 
 async fn fetch_recent_log(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     kind: EntryKind,
     uuid: uuid::Uuid,
 ) -> Result<service::LogResponse, String> {
@@ -1664,7 +1664,7 @@ fn render_log_response(log: &service::LogResponse) -> String {
 }
 
 async fn fetch_history(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     kind: EntryKind,
     uuid: uuid::Uuid,
 ) -> Result<service::HistoryResponse, String> {
@@ -1703,7 +1703,7 @@ fn format_duration_ms(duration_ms: i64) -> String {
 /// non-interactive commands, a failure here shouldn't exit the process, just
 /// update the status line with what happened.
 async fn post_watch_action(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     path: &str,
     success_message: &str,
 ) -> Result<String, String> {
@@ -1829,7 +1829,7 @@ mod tests {
     fn render_at(width: u16, height: u16, state: &UiState) -> String {
         let backend = TestBackend::new(width, height);
         let mut terminal = Terminal::new(backend).unwrap();
-        let config: SundialdConfig = serde_yaml::from_str("jobs: []\n").unwrap();
+        let config = ClientConfig::default();
         terminal
             .draw(|frame| draw_ui(frame, &config, state))
             .unwrap();

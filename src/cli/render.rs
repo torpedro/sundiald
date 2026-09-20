@@ -3,16 +3,16 @@ use chrono::{DateTime, Local};
 use colored::Colorize;
 
 use super::client::fetch_status;
-use crate::{config::SundialdConfig, service, state};
+use crate::{client_config::ClientConfig, service, state};
 
-pub(crate) async fn print_status(config: &SundialdConfig) -> Result<()> {
+pub(crate) async fn print_status(config: &ClientConfig) -> Result<()> {
     let (frame, _jobs) = render_status(config, None, None).await?;
     print!("{frame}");
     Ok(())
 }
 
 pub(crate) async fn render_status(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     selected: Option<usize>,
     last_command: Option<&str>,
 ) -> Result<(String, Vec<service::JobStatusResponse>)> {

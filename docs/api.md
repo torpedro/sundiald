@@ -1,6 +1,6 @@
 # HTTP API
 
-`daemon` starts an HTTP API at `api_bind`. Loopback bindings do not require authentication. A non-loopback `api_bind` is rejected unless `api_token` is configured; all endpoints except `/health` then require `Authorization: Bearer <api_token>`. The bundled CLI reads the same config and supplies this header automatically. The API serves plain HTTP, so use a trusted private network or a TLS reverse proxy when exposing it beyond the host.
+`daemon` starts an HTTP API at `api_bind`. Loopback bindings do not require authentication. A non-loopback `api_bind` is rejected unless `api_token` is configured; all endpoints except `/health` then require `Authorization: Bearer <api_token>`. The bundled CLI reads its own [client connection settings](client-configuration.md) and supplies the token as a bearer header automatically. The API serves plain HTTP, so use a trusted private network or a TLS reverse proxy when exposing it beyond the host.
 
 ```sh
 curl http://127.0.0.1:8787/status

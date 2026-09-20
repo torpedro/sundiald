@@ -1,5 +1,14 @@
 # Configuration
 
+This file configures the daemon. CLI/UI connection settings are independent; see
+[client connections](client-configuration.md). The `daemon` and `config` commands
+select server YAML using `--config`, then `SUNDIALD_CONFIG`, then
+`$XDG_CONFIG_HOME/sundiald/config.yaml` when XDG is an absolute, nonempty path,
+otherwise `$HOME/.config/sundiald/config.yaml`. If the user file is absent, they
+use `/etc/sundiald/config.yaml`. The first selected file is used alone. Missing
+explicit paths and unreadable or invalid files are errors; they do not cause
+fallback to another file. A server configuration file is required.
+
 Generate a starter config:
 
 ```sh

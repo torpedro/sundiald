@@ -1,23 +1,26 @@
 mod cli;
+mod client_config;
 mod config;
+mod config_path;
 mod service;
 mod state;
 
-use std::{env, path::PathBuf};
+use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
+use crate::client_config::ClientOptions;
 use crate::config::SundialdConfig;
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "sundiald", version, about = "A scheduled shell job runner")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Command {
     /// Run the long-lived job runner daemon.
     Daemon {
@@ -35,89 +38,83 @@ enum Command {
     Run {
         /// Job name to run.
         job: String,
-        /// YAML config file to load.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
     },
     /// Send SIGTERM to a running job.
     Terminate {
         /// Job name to terminate.
         job: String,
-        /// YAML config file to load.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
     },
     /// Send SIGKILL to a running job.
     Kill {
         /// Job name to kill.
         job: String,
-        /// YAML config file to load.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
     },
     /// Start a configured service.
     StartService {
         /// Service name or UUID to start.
         service: String,
-        /// YAML config file to load.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
     },
     /// Stop a running service with SIGTERM.
     StopService {
         /// Service name or UUID to stop.
         service: String,
-        /// YAML config file to load.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
     },
     /// Stop a running service with SIGKILL.
     KillService {
         /// Service name or UUID to kill.
         service: String,
-        /// YAML config file to load.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
     },
     /// Tell the running service to reload its config from disk.
     Reload {
-        /// YAML config file to load (used to locate the running service's API).
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
     },
     /// Show recent run history for a job.
     History {
         /// Job name or UUID to inspect.
         job: String,
-        /// YAML config file to load.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
         /// Maximum number of runs to show.
         #[arg(short, long, default_value_t = 20)]
         limit: usize,
     },
     /// Open the interactive status UI.
     Ui {
-        /// YAML config file to inspect.
-        #[arg(short, long)]
-        config: Option<PathBuf>,
+        #[command(flatten)]
+        connection: ClientOptions,
         /// Print one status frame instead of opening the interactive UI.
         #[arg(long)]
         once: bool,
     },
     /// Print a starter YAML config.
     SampleConfig,
+    /// Print a starter client connection config.
+    SampleClientConfig,
+    /// Show resolved client connection settings without exposing the token.
+    ClientConfig {
+        #[command(flatten)]
+        connection: ClientOptions,
+    },
 }
 
-fn default_config_path() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("~"))
-        .join(".config/sundiald/config.yaml")
-}
-
-fn resolve_config_path(config: Option<PathBuf>) -> PathBuf {
-    config.unwrap_or_else(default_config_path)
+fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
+    let environment = config_path::environment();
+    let explicit = config.or_else(|| environment.get("SUNDIALD_CONFIG").map(PathBuf::from));
+    config_path::discover(explicit, &environment, "config.yaml", Path::new("/etc/sundiald"))?
+        .context("no server config found in the user config directory or /etc/sundiald/config.yaml; supply --config")
 }
 
 #[tokio::main]
@@ -128,12 +125,12 @@ async fn main() -> Result<()> {
         Command::Daemon {
             config: config_path,
         } => {
-            let config_path = resolve_config_path(config_path);
+            let config_path = resolve_config_path(config_path)?;
             let config = SundialdConfig::load_and_ensure_ids(&config_path)?;
             service::run(config, config_path).await
         }
         Command::Config { config } => {
-            let config = resolve_config_path(config);
+            let config = resolve_config_path(config)?;
             let config = SundialdConfig::load(&config)?;
             println!("config: ok");
             println!("state_dir: {}", config.state_dir.display());
@@ -202,9 +199,8 @@ async fn main() -> Result<()> {
             }
             Ok(())
         }
-        Command::Run { job, config } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::Run { job, connection } => {
+            let config = connection.load()?;
             cli::post_job_action(
                 &config,
                 &job,
@@ -213,9 +209,8 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Terminate { job, config } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::Terminate { job, connection } => {
+            let config = connection.load()?;
             cli::post_job_action(
                 &config,
                 &job,
@@ -224,14 +219,15 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Kill { job, config } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::Kill { job, connection } => {
+            let config = connection.load()?;
             cli::post_job_action(&config, &job, "kill", &format!("sent SIGKILL to {job}")).await
         }
-        Command::StartService { service, config } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::StartService {
+            service,
+            connection,
+        } => {
+            let config = connection.load()?;
             cli::post_service_action(
                 &config,
                 &service,
@@ -240,9 +236,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::StopService { service, config } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::StopService {
+            service,
+            connection,
+        } => {
+            let config = connection.load()?;
             cli::post_service_action(
                 &config,
                 &service,
@@ -251,9 +249,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::KillService { service, config } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::KillService {
+            service,
+            connection,
+        } => {
+            let config = connection.load()?;
             cli::post_service_action(
                 &config,
                 &service,
@@ -262,24 +262,53 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Command::Reload { config } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::Reload { connection } => {
+            let config = connection.load()?;
             cli::reload_config(&config).await
         }
-        Command::History { job, config, limit } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::History {
+            job,
+            connection,
+            limit,
+        } => {
+            let config = connection.load()?;
             cli::print_history(&config, &job, limit).await
         }
-        Command::Ui { config, once } => {
-            let config = resolve_config_path(config);
-            let config = SundialdConfig::load(&config)?;
+        Command::Ui { connection, once } => {
+            let config = connection.load()?;
             if once {
                 cli::print_status(&config).await?;
             } else {
                 cli::watch_status(config).await?;
             }
+            Ok(())
+        }
+        Command::SampleClientConfig => {
+            print!(
+                "url: http://127.0.0.1:8787\n# token_file: api-token\n# Or use token_env: MY_SUNDIALD_TOKEN\n"
+            );
+            Ok(())
+        }
+        Command::ClientConfig { connection } => {
+            let config = connection.load()?;
+            println!(
+                "client config: {}",
+                config
+                    .source
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".into())
+            );
+            println!("url: {} ({})", config.url, config.url_source);
+            println!(
+                "token: {} ({})",
+                if config.token.is_some() {
+                    "configured"
+                } else {
+                    "not configured"
+                },
+                config.token_source
+            );
             Ok(())
         }
         Command::SampleConfig => {

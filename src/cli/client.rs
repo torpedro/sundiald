@@ -2,10 +2,10 @@ use std::{sync::OnceLock, time::Duration};
 
 use anyhow::Result;
 
-use crate::{config::SundialdConfig, service};
+use crate::{client_config::ClientConfig, service};
 
-pub(crate) fn api_base(config: &SundialdConfig) -> String {
-    format!("http://{}", config.api_bind)
+pub(crate) fn api_base(config: &ClientConfig) -> String {
+    config.url.clone()
 }
 
 pub(crate) fn api_client() -> reqwest::Client {
@@ -13,6 +13,7 @@ pub(crate) fn api_client() -> reqwest::Client {
     CLIENT
         .get_or_init(|| {
             reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(3))
                 .timeout(Duration::from_secs(10))
                 .build()
@@ -22,10 +23,10 @@ pub(crate) fn api_client() -> reqwest::Client {
 }
 
 pub(crate) fn authorize(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     request: reqwest::RequestBuilder,
 ) -> reqwest::RequestBuilder {
-    match &config.api_token {
+    match &config.token {
         Some(token) => request.bearer_auth(token),
         None => request,
     }
@@ -46,7 +47,7 @@ pub(crate) fn encode_path_segment(value: &str) -> String {
 
 /// POSTs to `path` on the configured sundiald API, with a uniform connection
 /// error message shared by every CLI command that talks to the API.
-pub(crate) async fn post_api(config: &SundialdConfig, path: &str) -> Result<reqwest::Response> {
+pub(crate) async fn post_api(config: &ClientConfig, path: &str) -> Result<reqwest::Response> {
     authorize(
         config,
         api_client().post(format!("{}{path}", api_base(config))),
@@ -61,7 +62,7 @@ pub(crate) async fn post_api(config: &SundialdConfig, path: &str) -> Result<reqw
     })
 }
 
-pub(crate) async fn get_api(config: &SundialdConfig, path: &str) -> Result<reqwest::Response> {
+pub(crate) async fn get_api(config: &ClientConfig, path: &str) -> Result<reqwest::Response> {
     authorize(
         config,
         api_client().get(format!("{}{path}", api_base(config))),
@@ -91,7 +92,7 @@ pub(crate) async fn report_response(
     }
 }
 
-pub(crate) async fn fetch_status(config: &SundialdConfig) -> Result<service::StatusResponse> {
+pub(crate) async fn fetch_status(config: &ClientConfig) -> Result<service::StatusResponse> {
     authorize(
         config,
         api_client().get(format!("{}/status", api_base(config))),
@@ -124,8 +125,10 @@ mod tests {
 
     #[test]
     fn authorize_adds_the_configured_bearer_token() {
-        let config: SundialdConfig =
-            serde_yaml::from_str("api_token: test-secret\njobs: []\n").unwrap();
+        let config = ClientConfig {
+            token: Some("test-secret".into()),
+            ..ClientConfig::default()
+        };
         let request = authorize(&config, api_client().get("http://127.0.0.1/status"))
             .build()
             .unwrap();

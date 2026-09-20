@@ -4,7 +4,7 @@ mod watch;
 
 use anyhow::Result;
 
-use crate::config::SundialdConfig;
+use crate::client_config::ClientConfig;
 use client::{encode_path_segment, get_api, post_api, report_response};
 
 pub(crate) use render::print_status;
@@ -21,7 +21,7 @@ pub(crate) use watch::watch_status;
 /// local pre-check here would incorrectly block `terminate`/`kill` on a
 /// name the local config no longer lists but the server is still tracking.
 pub(crate) async fn post_job_action(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     job: &str,
     action: &str,
     success_message: &str,
@@ -32,7 +32,7 @@ pub(crate) async fn post_job_action(
 }
 
 pub(crate) async fn post_service_action(
-    config: &SundialdConfig,
+    config: &ClientConfig,
     service: &str,
     action: &str,
     success_message: &str,
@@ -42,12 +42,12 @@ pub(crate) async fn post_service_action(
     report_response(response, action, success_message).await
 }
 
-pub(crate) async fn reload_config(config: &SundialdConfig) -> Result<()> {
+pub(crate) async fn reload_config(config: &ClientConfig) -> Result<()> {
     let response = post_api(config, "/reload").await?;
     report_response(response, "reload", "config reloaded").await
 }
 
-pub(crate) async fn print_history(config: &SundialdConfig, job: &str, limit: usize) -> Result<()> {
+pub(crate) async fn print_history(config: &ClientConfig, job: &str, limit: usize) -> Result<()> {
     let job = encode_path_segment(job);
     let response = get_api(config, &format!("/jobs/{job}/history?limit={limit}")).await?;
     if !response.status().is_success() {

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Discover server and client files from explicit paths, then the XDG/home user
+  directory, then `/etc/sundiald`. Selected files are never merged or silently
+  skipped on parse/read errors.
+- Separate client connection settings from daemon configuration. Clients default
+  to localhost and support `client.yaml`, URL/token overrides, token files, and
+  environment references. Existing nondefault connections must migrate to client
+  settings; client commands no longer accept `--config` or daemon YAML.
+- Add XDG config discovery, `SUNDIALD_CONFIG` / `SUNDIALD_CLIENT_CONFIG` path
+  overrides, and redacted `client-config` diagnostics.
+
 ## 0.1.1 - 2026-09-20
 
 - Add `scripts/make_release.sh`, an interactive helper that bumps the version, updates the changelog, verifies packaging, and optionally commits, publishes, tags, and pushes the tag.

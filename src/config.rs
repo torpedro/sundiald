@@ -1479,6 +1479,9 @@ alert:
         assert_eq!(config.alert.event_dir, base.join("alerts"));
     }
 
+    // Both the generated sample and the placeholder substitution below key off
+    // HOME, which is not set on Windows.
+    #[cfg(unix)]
     #[test]
     fn sample_config_matches_example_file() {
         // Keeps sample_config(), the README snippet, and examples/sundiald.yaml

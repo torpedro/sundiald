@@ -1758,6 +1758,9 @@ mod tests {
         handle.abort();
     }
 
+    // Without HOME the default state_dir stays a relative "~" path, which reload
+    // rejects as a state_dir change once it is resolved against the working directory.
+    #[cfg(unix)]
     #[tokio::test]
     async fn api_reload_endpoint_picks_up_config_changes_from_disk() {
         let temp = tempfile::tempdir().unwrap();

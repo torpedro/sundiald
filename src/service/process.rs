@@ -1209,6 +1209,8 @@ mod tests {
         assert!(entries.next_entry().await.unwrap().is_some());
     }
 
+    // Signalling a process group is unix-only; the stub returns an error elsewhere.
+    #[cfg(unix)]
     #[tokio::test]
     async fn expected_service_sigterm_records_success_without_alerting() {
         let temp = tempfile::tempdir().unwrap();

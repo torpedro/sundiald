@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.4 - 2026-09-20
+
 - Discover server and client files from explicit paths, then the XDG/home user
   directory, then `/etc/sundiald`. Selected files are never merged or silently
   skipped on parse/read errors.

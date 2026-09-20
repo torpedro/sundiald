@@ -116,7 +116,7 @@ and [publishing guide](https://doc.rust-lang.org/cargo/reference/publishing.html
 After confirming publication, tag the same commit:
 
 ```sh
-git tag -a v0.1.1 -m "Release 0.1.1"
+git tag -a v0.1.1 -m "sundiald 0.1.1"
 git push origin v0.1.1
 ```
 

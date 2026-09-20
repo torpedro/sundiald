@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.1 - 2026-09-20
+
 - Add `scripts/make_release.sh`, an interactive helper that bumps the version, updates the changelog, and optionally commits and tags.
 
 - Add Flares as an alert destination. Configure it under `alert.flares`; alerts continue to run alongside any configured `alert.command` and Pushover destinations.

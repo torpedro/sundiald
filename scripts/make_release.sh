@@ -8,7 +8,7 @@
 set -euo pipefail
 
 PROJECT_NAME="sundiald"
-TAG_MESSAGE_PREFIX="Release"
+TAG_MESSAGE_PREFIX="sundiald"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

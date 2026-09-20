@@ -7,14 +7,17 @@ use std::{
 use anyhow::Result;
 use chrono::Local;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
+        MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{
@@ -166,10 +169,19 @@ impl UiEntry {
     }
 }
 
+#[derive(Debug, Clone)]
+enum MouseTarget {
+    Pane(Focus),
+    Entry(uuid::Uuid),
+    Group(EntryKind, String),
+    Tab(DetailMode),
+}
+
 #[derive(Debug)]
 struct UiState {
     selected_uuid: Option<uuid::Uuid>,
     sidebar_state: ListState,
+    mouse_targets: Vec<(Rect, MouseTarget)>,
     entries: Vec<UiEntry>,
     message: String,
     message_expires_at: Option<time::Instant>,
@@ -196,6 +208,7 @@ impl UiState {
         Self {
             selected_uuid: None,
             sidebar_state: ListState::default(),
+            mouse_targets: Vec::new(),
             entries: Vec::new(),
             message: "connecting".to_string(),
             message_expires_at: None,
@@ -313,7 +326,7 @@ pub(crate) async fn watch_status(config: ClientConfig) -> Result<()> {
     let mut terminal = WatchTerminal::enter()?;
     let mut state = UiState::new();
     let mut interval = time::interval(Duration::from_secs(1));
-    let mut keys = spawn_key_reader();
+    let mut input = spawn_input_reader();
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
     request_status(&config, &mut state, &event_tx);
@@ -343,12 +356,14 @@ pub(crate) async fn watch_status(config: ClientConfig) -> Result<()> {
                     terminal.draw(|frame| draw_ui(frame, &config, &mut state))?;
                 }
             }
-            key = keys.recv() => {
-                let Some(key) = key else {
-                    continue;
-                };
-                if handle_key(key, &config, &mut state, &event_tx) {
-                    break;
+            event = input.recv() => {
+                let Some(event) = event else { break; };
+                match event {
+                    Event::Key(key) => {
+                        if handle_key(key, &config, &mut state, &event_tx) { break; }
+                    }
+                    Event::Mouse(mouse) => handle_mouse(mouse, &config, &mut state, &event_tx),
+                    _ => {}
                 }
                 terminal.draw(|frame| draw_ui(frame, &config, &mut state))?;
             }
@@ -356,6 +371,72 @@ pub(crate) async fn watch_status(config: ClientConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn handle_mouse(
+    mouse: MouseEvent,
+    config: &ClientConfig,
+    state: &mut UiState,
+    event_tx: &mpsc::UnboundedSender<UiEvent>,
+) {
+    if state.input_mode != InputMode::Normal {
+        return;
+    }
+    let position = Position::new(mouse.column, mouse.row);
+    let Some(target) = state
+        .mouse_targets
+        .iter()
+        .rev()
+        .find(|(area, _)| area.contains(position))
+        .map(|(_, target)| target.clone())
+    else {
+        return;
+    };
+    let focus = match &target {
+        MouseTarget::Pane(focus) => *focus,
+        MouseTarget::Entry(_) | MouseTarget::Group(_, _) => Focus::Sidebar,
+        MouseTarget::Tab(_) => Focus::Details,
+    };
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            state.focus = focus;
+            match target {
+                MouseTarget::Entry(uuid) if state.selected_uuid != Some(uuid) => {
+                    state.selected_uuid = Some(uuid);
+                    selection_changed(config, state, event_tx);
+                }
+                MouseTarget::Group(kind, group) => {
+                    let key = (kind, group);
+                    if !state.collapsed_groups.remove(&key) {
+                        state.collapsed_groups.insert(key);
+                    }
+                    let previous = state.selected_uuid;
+                    state.reconcile_selection();
+                    if state.selected_uuid != previous {
+                        selection_changed(config, state, event_tx);
+                    }
+                }
+                MouseTarget::Tab(mode) if state.detail_mode != mode => {
+                    state.set_detail_mode(mode);
+                    request_selected_detail(config, state, event_tx);
+                }
+                _ => {}
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let down = mouse.kind == MouseEventKind::ScrollDown;
+            if focus == Focus::Sidebar {
+                if state.move_selection(if down { 3 } else { -3 }) {
+                    selection_changed(config, state, event_tx);
+                }
+            } else if down {
+                state.detail_scroll = state.detail_scroll.saturating_add(3);
+            } else {
+                state.detail_scroll = state.detail_scroll.saturating_sub(3);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn handle_key(
@@ -802,6 +883,7 @@ fn start_kill(
 }
 
 fn draw_ui(frame: &mut Frame<'_>, config: &ClientConfig, state: &mut UiState) {
+    state.mouse_targets.clear();
     if frame.area().width < 40 || frame.area().height < 12 {
         frame.render_widget(
             Paragraph::new("sundiald — resize to at least 40×12. q quits."),
@@ -880,6 +962,10 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, config: &ClientConfig, state: 
 fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
     let mut items = Vec::new();
     let mut selected = None;
+    let mut row_targets = Vec::new();
+    state
+        .mouse_targets
+        .push((area, MouseTarget::Pane(Focus::Sidebar)));
     for (kind, title) in [(EntryKind::Job, "Jobs"), (EntryKind::Service, "Services")] {
         if kind == EntryKind::Service {
             items.push(ListItem::new(""));
@@ -898,6 +984,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
                 .first()
                 .is_some_and(|entry| state.group_collapsed(entry));
             if let Some(group) = &group {
+                row_targets.push((items.len(), MouseTarget::Group(kind, group.clone())));
                 items.push(
                     ListItem::new(format!("{} {group}", if collapsed { "▸" } else { "▾" }))
                         .style(Style::default().fg(MUTED)),
@@ -907,6 +994,7 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
                 continue;
             }
             for entry in entries {
+                row_targets.push((items.len(), MouseTarget::Entry(entry.uuid)));
                 if state.selected_uuid == Some(entry.uuid) {
                     selected = Some(items.len());
                 }
@@ -946,11 +1034,24 @@ fn draw_sidebar(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
         )
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
+    let inner = Block::default().borders(Borders::ALL).inner(area);
     state.sidebar_state.select(selected);
     frame.render_stateful_widget(list, area, &mut state.sidebar_state);
+    let offset = state.sidebar_state.offset();
+    for (row, target) in row_targets {
+        if row >= offset && row - offset < usize::from(inner.height) {
+            state.mouse_targets.push((
+                Rect::new(inner.x, inner.y + (row - offset) as u16, inner.width, 1),
+                target,
+            ));
+        }
+    }
 }
 
-fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
+fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &mut UiState) {
+    state
+        .mouse_targets
+        .push((area, MouseTarget::Pane(Focus::Details)));
     let name = state
         .selected_entry()
         .map(|entry| entry.name.as_str())
@@ -974,6 +1075,20 @@ fn draw_details(frame: &mut Frame<'_>, area: Rect, state: &UiState) {
         .highlight_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
         .divider(" | ");
     frame.render_widget(tabs, chunks[0]);
+    let mut x = chunks[0].x;
+    for (label, mode) in [
+        ("Summary", DetailMode::Summary),
+        ("Log", DetailMode::Log),
+        ("History", DetailMode::History),
+        ("Schedule", DetailMode::Schedule),
+    ] {
+        let width = label.len() as u16 + 2; // Tabs have one space of padding on each side.
+        let rect = Rect::new(x, chunks[0].y, width, 1).intersection(chunks[0]);
+        if !rect.is_empty() {
+            state.mouse_targets.push((rect, MouseTarget::Tab(mode)));
+        }
+        x = x.saturating_add(width + 3); // " | " divider
+    }
 
     if state.detail_loading {
         frame.render_widget(
@@ -1243,6 +1358,7 @@ fn draw_help(frame: &mut Frame<'_>) {
     let help = [
         "Navigation        ↑/↓ or j/k, Home/End, PgUp/PgDn",
         "Focus             Tab switches sidebar/details",
+        "Mouse             click entries, groups or tabs; wheel scrolls",
         "Groups            g collapse, G expand all",
         "Details           i summary, Enter log, h history, s schedule",
         "Logs              F toggles automatic follow",
@@ -1547,13 +1663,11 @@ async fn post_watch_action(
     }
 }
 
-fn spawn_key_reader() -> mpsc::UnboundedReceiver<KeyEvent> {
+fn spawn_input_reader() -> mpsc::UnboundedReceiver<Event> {
     let (tx, rx) = mpsc::unbounded_channel();
     thread::spawn(move || {
         while let Ok(event) = event::read() {
-            if let Event::Key(key) = event
-                && tx.send(key).is_err()
-            {
+            if tx.send(event).is_err() {
                 break;
             }
         }
@@ -1574,7 +1688,7 @@ impl WatchTerminal {
         }
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
+        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
         Ok(Self { terminal })
     }
@@ -1591,7 +1705,11 @@ impl WatchTerminal {
 impl Drop for WatchTerminal {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let _ = execute!(
+            self.terminal.backend_mut(),
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = self.terminal.show_cursor();
     }
 }
@@ -1901,6 +2019,144 @@ mod tests {
         );
         assert!(render_at(40, 18, &mut state).contains("Browse"));
         assert!(render_at(39, 10, &mut state).contains("resize"));
+    }
+
+    #[test]
+    fn mouse_selects_visible_rows_and_tabs() {
+        let config = ClientConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = UiState::new();
+        state.entries = (0..30)
+            .map(|index| {
+                let mut entry = job_entry();
+                entry.name = format!("job-{index:02}");
+                entry
+            })
+            .collect();
+        let worker = service_entry(crate::state::JobStatus::Running, true);
+        let worker_id = worker.uuid;
+        state.entries.push(worker);
+        state.selected_uuid = Some(state.entries[29].uuid);
+        let output = render_at(100, 24, &mut state);
+        let row = output
+            .lines()
+            .position(|line| line.contains("job-28"))
+            .unwrap() as u16;
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &config,
+            &mut state,
+            &tx,
+        );
+        assert_eq!(state.selected_uuid, Some(state.entries[28].uuid));
+
+        state.selected_uuid = Some(worker_id);
+        let output = render_at(100, 24, &mut state);
+        let (row, line) = output
+            .lines()
+            .enumerate()
+            .find(|(_, line)| line.contains("Schedule"))
+            .unwrap();
+        let column = line[..line.find("Schedule").unwrap()].chars().count() as u16;
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row: row as u16,
+                modifiers: KeyModifiers::NONE,
+            },
+            &config,
+            &mut state,
+            &tx,
+        );
+        assert_eq!(state.focus, Focus::Details);
+        assert_eq!(state.detail_mode, DetailMode::Schedule);
+
+        let output = render_at(100, 24, &mut state);
+        let row = output
+            .lines()
+            .position(|line| line.contains("● worker"))
+            .unwrap() as u16;
+        handle_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+            &config,
+            &mut state,
+            &tx,
+        );
+        assert_eq!(state.focus, Focus::Sidebar);
+        assert_eq!(state.selected_uuid, Some(worker_id));
+    }
+
+    #[test]
+    fn mouse_toggles_groups_and_ignores_background_clicks_during_dialogs() {
+        let config = ClientConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = UiState::new();
+        let mut entry = job_entry();
+        entry.group = Some("maintenance".into());
+        state.entries = vec![entry];
+        state.reconcile_selection();
+        let output = render_at(80, 24, &mut state);
+        let row = output
+            .lines()
+            .position(|line| line.contains("▾ maintenance"))
+            .unwrap() as u16;
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(click, &config, &mut state, &tx);
+        assert!(state.selected_uuid.is_none());
+        assert!(render_at(80, 24, &mut state).contains("▸ maintenance"));
+        state.input_mode = InputMode::Help;
+        handle_mouse(click, &config, &mut state, &tx);
+        assert_eq!(state.collapsed_groups.len(), 1);
+        state.input_mode = InputMode::ConfirmKill {
+            uuid: state.entries[0].uuid,
+            name: "example".into(),
+        };
+        handle_mouse(click, &config, &mut state, &tx);
+        assert_eq!(state.collapsed_groups.len(), 1);
+        state.input_mode = InputMode::Normal;
+        handle_mouse(click, &config, &mut state, &tx);
+        assert!(state.collapsed_groups.is_empty());
+        assert_eq!(state.selected_uuid, Some(state.entries[0].uuid));
+        render_at(39, 10, &mut state);
+        assert!(state.mouse_targets.is_empty());
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_the_pane_under_the_pointer() {
+        let config = ClientConfig::default();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = UiState::new();
+        state.entries = vec![job_entry(), job_entry()];
+        state.reconcile_selection();
+        render_at(80, 24, &mut state);
+        let mut wheel = MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 30,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(wheel, &config, &mut state, &tx);
+        assert_eq!(state.detail_scroll, 3);
+        assert_eq!(state.selected_uuid, Some(state.entries[0].uuid));
+        wheel.column = 5;
+        handle_mouse(wheel, &config, &mut state, &tx);
+        assert_eq!(state.selected_uuid, Some(state.entries[1].uuid));
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.5 - 2026-09-28
+
 ## 0.1.4 - 2026-09-20
 
 - Discover server and client files from explicit paths, then the XDG/home user

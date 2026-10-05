@@ -468,22 +468,25 @@ checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
 name = "flares-client"
-version = "0.1.0"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2e53f6090f1b257e6e4570aff7ecb10fae82c2ff9faefe416ce43d1b760abdf"
+checksum = "d2ded5d6111c7edbabfeec4cb4978a82956e710fd429485d901c988d60e729f5"
 dependencies = [
+ "anyhow",
  "flares-types",
  "reqwest",
  "serde",
  "serde_json",
+ "serde_path_to_error",
+ "serde_yaml_ng",
  "thiserror",
 ]
 
 [[package]]
 name = "flares-types"
-version = "0.1.0"
+version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad099754922b9204850c8f3b9b17d7602275e187f023eb62dac5ae7b7c6a40cb"
+checksum = "28c0fb658d7e05132e92a45e3932b7d6b9952f1e98e1335e89bb68df43a771c7"
 dependencies = [
  "chrono",
  "serde",
@@ -1596,6 +1599,19 @@ name = "serde_yaml"
 version = "0.9.34+deprecated"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
+]
+
+[[package]]
+name = "serde_yaml_ng"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b4db627b98b36d4203a7b458cf3573730f2bb591b28871d916dfa9efabfd41f"
 dependencies = [
  "indexmap",
  "itoa",

@@ -38,6 +38,19 @@ pub(crate) fn expand_home(path: &Path, environment: &Environment) -> Result<Path
     Ok(path.to_path_buf())
 }
 
+/// Implicit config locations, highest priority first.
+pub(crate) fn candidates(
+    environment: &Environment,
+    filename: &str,
+    system_directory: &Path,
+) -> Vec<PathBuf> {
+    user_directory(environment)
+        .map(|p| p.join(filename))
+        .into_iter()
+        .chain(std::iter::once(system_directory.join(filename)))
+        .collect()
+}
+
 /// Select one file, never merge layers or hide errors in a selected file.
 /// Explicit paths are returned even if missing, so the loader reports the error.
 pub(crate) fn discover(
@@ -49,11 +62,7 @@ pub(crate) fn discover(
     if let Some(path) = explicit {
         return expand_home(&path, environment).map(Some);
     }
-    let paths = user_directory(environment)
-        .map(|p| p.join(filename))
-        .into_iter()
-        .chain(std::iter::once(system_directory.join(filename)));
-    for path in paths {
+    for path in candidates(environment, filename, system_directory) {
         if path
             .try_exists()
             .with_context(|| format!("failed to inspect config {}", path.display()))?
@@ -96,6 +105,23 @@ mod tests {
                 Some(explicit)
             );
         }
+    }
+
+    #[test]
+    fn candidates_list_user_before_system() {
+        let system = Path::new("/etc/sundiald");
+        let env = HashMap::from([("HOME".into(), OsString::from("/home/u"))]);
+        assert_eq!(
+            candidates(&env, "config.yaml", system),
+            vec![
+                PathBuf::from("/home/u/.config/sundiald/config.yaml"),
+                PathBuf::from("/etc/sundiald/config.yaml"),
+            ]
+        );
+        assert_eq!(
+            candidates(&HashMap::new(), "config.yaml", system),
+            vec![PathBuf::from("/etc/sundiald/config.yaml")]
+        );
     }
 
     #[test]

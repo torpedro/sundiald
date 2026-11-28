@@ -113,8 +113,21 @@ enum Command {
 fn resolve_config_path(config: Option<PathBuf>) -> Result<PathBuf> {
     let environment = config_path::environment();
     let explicit = config.or_else(|| environment.get("SUNDIALD_CONFIG").map(PathBuf::from));
-    config_path::discover(explicit, &environment, "config.yaml", Path::new("/etc/sundiald"))?
-        .context("no server config found in the user config directory or /etc/sundiald/config.yaml; supply --config")
+    let system_directory = Path::new("/etc/sundiald");
+    if let Some(path) =
+        config_path::discover(explicit, &environment, "config.yaml", system_directory)?
+    {
+        return Ok(path);
+    }
+    let searched: String = config_path::candidates(&environment, "config.yaml", system_directory)
+        .iter()
+        .enumerate()
+        .map(|(i, path)| format!("\n  {}. {}", i + 1, path.display()))
+        .collect();
+    anyhow::bail!(
+        "no server config found; searched (highest priority first):{searched}\n\
+         create one of these, pass --config <PATH>, or set SUNDIALD_CONFIG"
+    )
 }
 
 #[tokio::main]
